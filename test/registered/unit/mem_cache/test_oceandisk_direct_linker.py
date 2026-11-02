@@ -59,6 +59,44 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestOceanDiskStorage(CustomTestCase):
+    def test_vectorized_metadata_matches_scalar_abi(self):
+        for regions in (
+            [(10000, 100000), (200000, 100000)],
+            [(200000, 100000), (10000, 100000)],
+            [(10000, 100000), (9000, 102000), (200000, 100000)],
+        ):
+            with self.subTest(regions=regions):
+                storage = OceanDiskStorage.__new__(OceanDiskStorage)
+                storage.regions = regions
+                storage._build_mr_index()
+                storage._task_ids = itertools.count(1)
+                storage.connection_indices = (0, 1, 2, 3)
+                storage.connection_router = SimpleNamespace(select=lambda key: key % 4)
+                layers = [
+                    [
+                        OceanDiskRange(key, base + slot * 9000, size, layer * 16384)
+                        for base, size in ((10000, 512), (200000, 8448))
+                        for key, slot in ((7, 3), (2, 0), (9, 2))
+                    ]
+                    for layer in range(3)
+                ]
+                expected = []
+                for task, ranges in enumerate(layers, 1):
+                    row = pack_io(task, ranges, regions, storage.connection_indices)
+                    count = len(ranges)
+                    for i in range(count):
+                        pos = 1 + 4 * count + i
+                        row[pos] = (row[pos] + 511) & ~511
+                    expected.append(row)
+                actual = storage._pack_layer_batches(layers)[0]
+                self.assertEqual(actual.tolist(), expected)
+                self.assertTrue(actual.flags.c_contiguous)
+                self.assertEqual(storage._pack_layer_batches([]), [])
+                self.assertEqual(storage._pack_layer_batches([[]]), [])
+                layers[0][0] = OceanDiskRange(7, 1, 512)
+                with self.assertRaises(ValueError):
+                    storage._pack_layer_batches(layers)
+
     def test_exists_many_uses_one_batch_and_preserves_prefix_order(self):
         query_stream = Mock()
         storage = OceanDiskStorage.__new__(OceanDiskStorage)
@@ -194,6 +232,7 @@ class TestOceanDiskStorage(CustomTestCase):
         storage._closed = False
         storage.device = SimpleNamespace(index=0)
         storage.regions = [(1000, 4096), (10000, 4096)]
+        storage._build_mr_index()
         storage.connection_indices = (2, 5)
         storage.connection_router = SimpleNamespace(select=lambda key: (2, 5)[key % 2])
         storage._task_ids = itertools.count(1)
@@ -220,6 +259,7 @@ class TestOceanDiskStorage(CustomTestCase):
         fake_torch.cuda.device.side_effect = lambda *_: nullcontext()
         fake_torch.cuda.stream.side_effect = lambda *_: nullcontext()
         fake_torch.tensor.side_effect = lambda values, **_: Metadata(values)
+        fake_torch.from_numpy.side_effect = lambda values: Metadata(values.tolist())
         events = []
 
         def new_event():
@@ -405,6 +445,7 @@ class TestOceanDiskStorage(CustomTestCase):
     def test_legacy_direct_indexer_io_keeps_raw_offsets_and_pads_lengths(self):
         storage, trace, _ = self.make_storage()
         storage.regions = [(100000, 4 * 73728), (500000, 4 * 8448)]
+        storage._build_mr_index()
         layers = [
             [
                 OceanDiskRange(
@@ -867,6 +908,7 @@ class TestOceanDiskDirectLinker(CustomTestCase):
             for component in entry.buffer_meta
             for base, stride, _ in component
         ]
+        storage._build_mr_index()
         linker.storage = storage
         index = linker.layer_done_counter.update_producer()
         complete = linker.layer_done_counter.complete
