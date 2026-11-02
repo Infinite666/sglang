@@ -11,7 +11,7 @@ import logging
 import os
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -609,17 +609,28 @@ class OceanDiskStorage(HiCacheStorage):
                     )
                     native_times.append((time.perf_counter() - step) * 1000)
                 if perf_context is not None:
+                    submit_pending_end = pending_puts()
+                    # KV and Indexer use the same route. Count only the KV half
+                    # of one layer so each page is counted once per task.
+                    conn_pages = Counter()
+                    for batch in descriptors:
+                        row = batch[0]
+                        count = (len(row) - 1) // 6
+                        conn_pages.update(
+                            row[1 + 5 * count : 1 + 5 * count + count // 2]
+                        )
                     logger.info(
                         "[OceanDisk PERF GET SUBMIT] task=%s layers=%d calls=%d "
                         "native_call_ms=%.3f prepare_ms=%.3f "
-                        "pending_put_start=%d pending_put_end=%d",
+                        "pending_put_start=%d pending_put_end=%d conn_pages=%s",
                         task,
                         len(layers),
                         len(native_times),
                         sum(native_times),
                         (dispatch_started - started) * 1000,
                         submit_pending_start,
-                        pending_puts(),
+                        submit_pending_end,
+                        dict(sorted(conn_pages.items())),
                     )
                 for layer in range(len(layers)):
                     # A layer is usable only after every I/O batch containing
