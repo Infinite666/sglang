@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -413,16 +414,42 @@ class UnifiedCacheLinkerWrapper:
             device_hit_pages=0,
         )
         if perf_match:
+            rank_sync_ms = (time.perf_counter() - lookup_end) * 1000
+            # Inspect only the diagnostic path; do not retain live stack frames.
+            source = "unknown"
+            caller = "unknown"
+            frame = sys._getframe(1)
+            try:
+                for _ in range(16):
+                    if frame is None:
+                        break
+                    name = frame.f_code.co_name
+                    if name in ("match_prefix_for_req", "init_next_round_input"):
+                        source = name
+                        parent = frame.f_back
+                        if parent is not None:
+                            caller = f"{parent.f_code.co_name}:{parent.f_lineno}"
+                        del parent
+                        break
+                    frame = frame.f_back
+            finally:
+                del frame
+            query_seq = getattr(req, "_od_perf_query_seq", 0) + 1
+            req._od_perf_query_seq = query_seq
             logger.info(
                 "[OceanDisk PERF MATCH] rid=%s input_tokens=%d hbm_tokens=%d "
-                "query_pages=%d od_tokens=%d lookup_ms=%.3f rank_sync_ms=%.3f",
+                "query_pages=%d od_tokens=%d lookup_ms=%.3f rank_sync_ms=%.3f "
+                "query_seq=%d source=%s caller=%s",
                 req.rid,
                 len(key),
                 device_hit_len,
                 len(tail_hashes),
                 hit_pages * page,
                 (lookup_end - lookup_start) * 1000,
-                (time.perf_counter() - lookup_end) * 1000,
+                rank_sync_ms,
+                query_seq,
+                source,
+                caller,
             )
         if hit_pages == 0:
             return result

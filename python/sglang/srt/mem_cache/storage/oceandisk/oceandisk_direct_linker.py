@@ -150,10 +150,7 @@ class LayerWiseLoadCounter:
         futures = self.futures.get(index)
         if futures is None:
             return
-        perf_trace = (
-            os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
-            and get_tensor_model_parallel_rank() == 0
-        )
+        perf_trace = os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
         wait_start = time.perf_counter() if perf_trace else 0.0
         try:
             futures[threshold].result()
@@ -647,10 +644,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 self.storage.put_layers(layers)
         else:
             perf_kwargs = {}
-            if (
-                os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
-                and get_tensor_model_parallel_rank() == 0
-            ):
+            if os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1":
                 perf_kwargs["perf_context"] = (
                     counter_index,
                     self.pending_offload_tasks,
