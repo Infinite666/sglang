@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 MAX_GIDS_CONNECTIONS = 8  # od/gids_kernel.cu: MAX_CONN_NUM
 MAX_GIDS_RANGES = 409600  # od/gids_kernel.cu: MAX_BLOCK_NUM
+GET_METADATA_WIDTH = 40960  # od/cache_controller.py: max_block_pram_length
 logger = logging.getLogger(__name__)
 
 
@@ -547,20 +548,36 @@ class OceanDiskStorage(HiCacheStorage):
             sizes[:] = (sizes + 511) & ~511
         return [batch]
 
+    def reserve_get_metadata(self, num_layers):
+        # Called during Linker initialization, before starting the load worker.
+        rows = num_layers + 1
+        capacity = rows * GET_METADATA_WIDTH
+        self._get_metadata_cpu = self._torch.empty(
+            capacity, dtype=self._torch.int64, device="cpu", pin_memory=True
+        )
+        self._get_metadata_gpu = self._torch.empty(
+            capacity, dtype=self._torch.int64, device=self.device
+        )
+        logger.info(
+            "[OceanDisk GET metadata] device=%s rows=%d row_capacity=%d max_pages=%d "
+            "cpu_pinned_bytes=%d gpu_bytes=%d allocation=startup",
+            self.device,
+            rows,
+            GET_METADATA_WIDTH,
+            (GET_METADATA_WIDTH - 1) // 12,
+            capacity * 8,
+            capacity * 8,
+        )
+
     def _get_metadata_views(self, num_layers, count):
-        # The sole load worker reuses these only after get_layers has waited
-        # for all layer events (or drained the stream on failure).
+        # Reuse only after all prior layer events complete, or failure drains GET.
         width = 1 + 6 * count
         required = num_layers * width
-        if self._get_metadata_cpu is None or self._get_metadata_cpu.numel() < required:
-            capacity = 1 << (required - 1).bit_length()
-            cpu = self._torch.empty(
-                capacity, dtype=self._torch.int64, device="cpu", pin_memory=True
+        if width > GET_METADATA_WIDTH or required > self._get_metadata_cpu.numel():
+            raise ValueError(
+                "OceanDisk GET metadata exceeds the fixed startup capacity "
+                f"({GET_METADATA_WIDTH} int64 values per layer)."
             )
-            gpu = self._torch.empty(
-                capacity, dtype=self._torch.int64, device=self.device
-            )
-            self._get_metadata_cpu, self._get_metadata_gpu = cpu, gpu
         # Flat storage gives contiguous rows even when a later task is smaller.
         cpu = self._get_metadata_cpu[:required].view(num_layers, width)
         gpu = self._get_metadata_gpu[:required].view(num_layers, width)

@@ -250,6 +250,8 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             if storage is None
             else storage
         )
+        if storage is None:
+            self.storage.reserve_get_metadata(self.num_layers)
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.load_queue = Queue()
