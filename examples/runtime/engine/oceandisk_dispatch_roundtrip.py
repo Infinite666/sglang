@@ -133,9 +133,6 @@ def main():
         parser.error("layers, pages and pool sizes must be positive")
     sizes = tuple((size + 511) // 512 * 512 for size in logical_sizes)
     payloads = tuple(layers * pages * size for size in sizes)
-    key_count = pages * (2 if args.separate_pool_keys else 1)
-    if key_count >= 1 << 63:
-        parser.error("too many keys for int64 metadata")
     for name in ("OPEXTENSION", "GIDS_DIR"):
         if not os.environ.get(name):
             parser.error(f"set {name} for your GIDS installation")
@@ -184,11 +181,23 @@ def main():
     if status != 0:
         raise RuntimeError(f"kvcache_init failed: {status}")
 
-    # Leave room for all consecutive keys in signed int64 metadata.
-    base_key = 1 + secrets.randbelow((1 << 63) - key_count)
-    index_base = base_key + pages if args.separate_pool_keys else base_key
-    keys = list(range(base_key, base_key + pages))
-    keys.extend(range(index_base, index_base + pages))
+    # Production keys are hashed page identities, i.e. uniformly spread over
+    # the DPU ring. Consecutive integers almost always stay inside one ring
+    # segment, so generate uniform 63-bit keys instead.
+    def random_keys(count, taken):
+        keys = []
+        while len(keys) < count:
+            key = 1 + secrets.randbelow((1 << 63) - 1)
+            if key in taken:
+                continue
+            taken.add(key)
+            keys.append(key)
+        return keys
+
+    taken = set()
+    kv_keys = random_keys(pages, taken)
+    index_keys = random_keys(pages, taken) if args.separate_pool_keys else kv_keys
+    keys = kv_keys + index_keys
     if args.conn is not None:
         conns = [args.conn] * len(keys)
     elif args.separate_pool_keys:
@@ -199,7 +208,7 @@ def main():
     print(
         f"layers={layers} pages={pages} logical_pool_bytes={logical_sizes} "
         f"aligned_pool_bytes={sizes} bytes_per_direction={sum(payloads)} "
-        f"kv_first_key={base_key} index_first_key={index_base} "
+        f"kv_first_key={kv_keys[0]} index_first_key={index_keys[0]} "
         f"seed={args.seed} config={config_path} connections={available} "
         f"dpus={dpu_ids} routed={dict(sorted(Counter(conns).items()))}"
     )
