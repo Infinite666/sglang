@@ -220,11 +220,19 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             and getattr(server_args, "attention_backend", None) == "dsa"
         )
         storage_cp_rank = 0 if shared_cp_cache else params.attn_cp_rank
-        self._skip_get_for_perf = (
-            tp_rank != 0 and os.environ.get("SGLANG_OCEANDISK_RANK0_GET_ONLY") == "1"
-        )
-        if self._skip_get_for_perf:
-            logger.warning("OceanDisk timing experiment: TP rank %d skips GET; inference results are invalid", tp_rank)
+        rank0_get_only = os.environ.get("SGLANG_OCEANDISK_RANK0_GET_ONLY") == "1"
+        self._skip_get_for_perf = False
+        if rank0_get_only:
+            # The attention cache group can be a singleton on every CP rank.
+            model_tp_rank = get_tensor_model_parallel_rank()
+            self._skip_get_for_perf = model_tp_rank != 0
+            logger.warning(
+                "OceanDisk timing experiment: model_tp_rank=%d cache_tp_rank=%d "
+                "skip_get=%s; inference results are invalid",
+                model_tp_rank,
+                tp_rank,
+                self._skip_get_for_perf,
+            )
         self.offload_owner = (not replicated or tp_rank == 0) and (
             not shared_cp_cache or params.attn_cp_rank == 0
         )
