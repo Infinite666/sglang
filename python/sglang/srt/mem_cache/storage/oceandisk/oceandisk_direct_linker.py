@@ -193,6 +193,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
+        self.page_size = params.page_size
         if self.num_layers <= 0:
             raise ValueError("OceanDisk requires at least one transfer layer.")
         self._validate_dsa_layout()
@@ -329,12 +330,41 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                     padded_offset += (size + 511) & ~511
             self._storage_offsets[name] = offsets
             layer_counts = []
+            layer_fragments = []
             for layer in range(self.num_layers):
                 meta = entry.get_prepared_layer_range_meta([0], layer)
                 if meta is None or not meta[1][0]:
                     raise ValueError("Each DSA layer needs KV and Indexer fragments.")
-                layer_counts.append(len(meta[1][0]))
+                fragments = [int(size) for size in meta[1][0]]
+                layer_counts.append(len(fragments))
+                layer_fragments.append(fragments)
             counts.extend(layer_counts)
+            # Raw (pre-padding) bytes for one page of one layer. This is what a
+            # round-trip test must be fed; metadata carries the 512-aligned size.
+            layouts = {}
+            for layer, fragments in enumerate(layer_fragments):
+                layouts.setdefault(tuple(fragments), []).append(layer)
+            logger.info(
+                "[OceanDisk raw sizes] pool=%s page_size=%s layers=%d "
+                "fragments=min%d/max%d page_bytes=%s aligned_bytes=%s "
+                "layout(layer_fragments -> first,last,count)=%s",
+                name,
+                self.page_size,
+                self.num_layers,
+                min(layer_counts),
+                max(layer_counts),
+                sorted({sum(fragments) for fragments in layer_fragments}),
+                sorted(
+                    {
+                        sum((size + 511) & ~511 for size in fragments)
+                        for fragments in layer_fragments
+                    }
+                ),
+                {
+                    ",".join(map(str, fragments)): (layers[0], layers[-1], len(layers))
+                    for fragments, layers in layouts.items()
+                },
+            )
         if len(set(counts)) != 1:
             raise ValueError(
                 "GIDS requires paired KV/Indexer IOs and equal IO counts across layers."

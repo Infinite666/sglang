@@ -254,6 +254,25 @@ class TestOceanDiskStorage(CustomTestCase):
             def __getitem__(self, selection):
                 return type(self)(self.values[selection])
 
+        def metadata_views(num_layers, count):
+            import numpy as np
+
+            values = np.empty((num_layers, 1 + 6 * count), dtype=np.int64)
+            cpu = Metadata(values.tolist())
+            cpu.numpy = lambda: values
+            gpu = Metadata(values.tolist())
+
+            def upload(source, *, non_blocking):
+                self.assertIs(source, cpu)
+                self.assertTrue(non_blocking)
+                cpu.values = values.tolist()
+                gpu.values = cpu.values.copy()
+
+            gpu.copy_ = upload
+            return cpu, gpu
+
+        storage._get_metadata_views = metadata_views
+
         fake_torch = Mock()
         fake_torch.metadata_uploads = []
         fake_torch.cuda.device.side_effect = lambda *_: nullcontext()
@@ -303,87 +322,58 @@ class TestOceanDiskStorage(CustomTestCase):
             for page in range(pages)
         ]
 
-    def test_get_publishes_each_layer_before_dispatching_the_next(self):
+    def test_get_submits_first_layer_then_remaining_before_publishing(self):
         storage, trace, events = self.make_storage()
         ready = []
         layers = [self.layer_ranges(2, layer) for layer in range(3)]
         storage.get_layers(
             layers,
-            max_ranges=8,
             on_layer_ready=lambda layer: (
                 ready.append(layer),
                 trace.append(("ready", layer)),
             ),
         )
         calls = self.od_utils.batch_dispatch_get.call_args_list
-        self.assertEqual(len(calls), 3)
-        for layer, call in enumerate(calls):
+        self.assertEqual(len(calls), 2)
+        for (first, last), call in zip(((0, 1), (1, 3)), calls):
             args = call.args
-            self.assertEqual(args[0].shape, (1, 25))
+            self.assertEqual(args[0].shape, (last - first, 25))
             self.assertEqual(args[1], 25)
             self.assertEqual(args[2].values, args[0].values)
-            self.assertEqual(args[4], [layer + 1])
-            self.assertEqual(args[5:], (123, 0, 0, 1, True, False))
-            row = args[0].values[0]
-            self.assertEqual(row[1:5], [0, 0, 1, 1])
-            self.assertEqual(row[5:9], [1, 2, 1, 2])
-            self.assertEqual(row[17:21], [512, 512, 512, 512])
-            self.assertEqual(row[21:25], [5, 2, 5, 2])
-            self.assertEqual(row[13:17], [layer * 512] * 2 + [layer * 256] * 2)
+            self.assertEqual(args[4], list(range(first + 1, last + 1)))
+            self.assertEqual(args[5:], (123, 0, 0, last - first, True, False))
+            for layer, row in enumerate(args[0].values, first):
+                self.assertEqual(row[1:5], [0, 0, 1, 1])
+                self.assertEqual(row[5:9], [1, 2, 1, 2])
+                self.assertEqual(row[17:21], [512, 512, 512, 512])
+                # The fixture routes odd keys to 5 and even keys to 2.
+                self.assertEqual(row[21:25], [5, 2, 5, 2])
+                self.assertEqual(row[13:17], [layer * 512] * 2 + [layer * 256] * 2)
         self.assertEqual(ready, [0, 1, 2])
         self.assertEqual(
             [kind for kind, _ in trace],
-            ["record"] * 3 + ["dispatch", "wait", "ready"] * 3,
+            ["record"] * 3 + ["dispatch"] * 2 + ["wait", "ready"] * 3,
         )
         storage._ops.kvcache_load_v2.assert_not_called()
 
-    def test_get_chunks_keep_pairs_and_wait_for_every_batch(self):
-        storage, trace, events = self.make_storage()
-        ready = []
+    def test_get_keeps_page_pairs_together_without_chunking(self):
+        storage, trace, _ = self.make_storage()
         layers = [self.layer_ranges(5, layer) for layer in range(2)]
         storage.get_layers(
-            layers,
-            max_ranges=5,
-            on_layer_ready=lambda layer: (
-                ready.append(layer),
-                trace.append(("ready", layer)),
-            ),
+            layers, on_layer_ready=lambda layer: trace.append(("ready", layer))
         )
+
         calls = self.od_utils.batch_dispatch_get.call_args_list
-        self.assertEqual(
-            [call.args[0].shape for call in calls],
-            [(1, 25), (1, 25), (1, 13)] * 2,
-        )
-        task_ids = []
-        for call in calls:
-            for row in call.args[0].values:
-                task_ids.append(row[0])
-                count = (len(row) - 1) // 6
-                half = count // 2
-                self.assertEqual(row[1 : 1 + half], [0] * half)
-                self.assertEqual(row[1 + half : 1 + count], [1] * half)
-                keys = row[1 + count : 1 + 2 * count]
-                self.assertEqual(keys[:half], keys[half:])
-        self.assertEqual(len(task_ids), len(set(task_ids)))
-        dispatches = [i for i, event in enumerate(trace) if event[0] == "dispatch"]
-        # All three page batches of layer 0 must finish before publication,
-        # and publication must precede even a blocking layer 1 dispatch.
-        self.assertLess(dispatches[2], trace.index(("ready", 0)))
-        self.assertLess(trace.index(("ready", 0)), dispatches[3])
-        first_wait = next(i for i, event in enumerate(trace) if event[0] == "wait")
-        self.assertEqual(sum(event[0] == "dispatch" for event in trace[:first_wait]), 3)
+        self.assertEqual([call.args[0].shape for call in calls], [(1, 61)] * 2)
+        rows = [call.args[0].values[0] for call in calls]
+        self.assertNotEqual(rows[0][0], rows[1][0])
+        for row in rows:
+            self.assertEqual(row[1:11], [0] * 5 + [1] * 5)
+            self.assertEqual(row[11:21], list(range(1, 6)) * 2)
+            self.assertEqual(row[51:61], [5, 2, 5, 2, 5] * 2)
         self.assertEqual(
             [event for event in trace if event[0] in ("wait", "ready")],
-            [
-                ("wait", 1),
-                ("wait", 3),
-                ("wait", 5),
-                ("ready", 0),
-                ("wait", 2),
-                ("wait", 4),
-                ("wait", 6),
-                ("ready", 1),
-            ],
+            [("wait", 1), ("ready", 0), ("wait", 2), ("ready", 1)],
         )
 
     def test_put_submits_all_layers_and_preserves_pairs_when_chunked(self):
