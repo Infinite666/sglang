@@ -220,6 +220,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             and getattr(server_args, "attention_backend", None) == "dsa"
         )
         storage_cp_rank = 0 if shared_cp_cache else params.attn_cp_rank
+        self._skip_get_for_perf = (
+            tp_rank != 0 and os.environ.get("SGLANG_OCEANDISK_RANK0_GET_ONLY") == "1"
+        )
+        if self._skip_get_for_perf:
+            logger.warning("OceanDisk timing experiment: TP rank %d skips GET; inference results are invalid", tp_rank)
         self.offload_owner = (not replicated or tp_rank == 0) and (
             not shared_cp_cache or params.attn_cp_rank == 0
         )
@@ -670,6 +675,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         )
 
     def _run_transfers(self, transfers, *, write: bool, counter_index=None) -> None:
+        if not write and getattr(self, "_skip_get_for_perf", False):
+            if counter_index is not None:
+                for layer in range(self.num_layers):
+                    self.layer_done_counter.complete(counter_index, layer)
+            return
         layers = self._transfer_layers(transfers)
         if write:
             if layers and layers[0]:
