@@ -104,19 +104,19 @@ def touch_file(path):
     Path(path).write_text(str(os.getpid()), encoding="utf-8")
 
 
-def wait_for_go(sync_dir):
-    """Busy-wait until the launcher's shared start timestamp."""
+def wait_for_go(sync_dir, worker_index, stagger_ms):
+    """Wait until base + worker_index * stagger, using one shared base."""
     path = os.path.join(sync_dir, "go")
     wait_for_file(path, timeout=600)
-    target = int(Path(path).read_text(encoding="utf-8").strip())
+    base = int(Path(path).read_text(encoding="utf-8").strip())
+    target = base + int(round(worker_index * stagger_ms * 1e6))
     while True:
         remaining = (target - time.time_ns()) / 1e9
         if remaining <= 0:
             break
         if remaining > 0.002:
             time.sleep(remaining - 0.002)
-    detected = time.time_ns()
-    return target, detected
+    return base, target, time.time_ns()
 
 
 def gids_config_path(config_dir, device_index, use_single_port):
@@ -196,7 +196,7 @@ def report_routing(label, rows):
 def dispatch(label, submit, events, stream, per_layer=False, quiet=False, start_wait=None):
     for event in events:
         event.record(stream)
-    target = start_wait() if start_wait is not None else None
+    sync = start_wait() if start_wait is not None else None
     started = time.perf_counter()
     submit_ns = time.time_ns()
     submit([event.cuda_event for event in events])
@@ -206,17 +206,21 @@ def dispatch(label, submit, events, stream, per_layer=False, quiet=False, start_
         event.synchronize()
         marks.append((time.perf_counter() - returned) * 1000)
     finished = time.perf_counter()
+    finished_ns = time.time_ns()
     metrics = {
         "call_ms": (returned - started) * 1000,
         "wait_ms": (finished - returned) * 1000,
         "total_ms": (finished - started) * 1000,
         "marks": marks,
+        "submit_ns": submit_ns,
+        "finished_ns": finished_ns,
     }
     if not quiet:
         print(
             f"{label}: call_ms={metrics['call_ms']:.3f} "
             f"event_wait_ms={metrics['wait_ms']:.3f} "
-            f"total_ms={metrics['total_ms']:.3f}"
+            f"total_ms={metrics['total_ms']:.3f} "
+            f"submit_ns={submit_ns} finished_ns={finished_ns}"
         )
         if per_layer:
             # Events are recorded by native after each layer's I/O on the same
@@ -228,11 +232,11 @@ def dispatch(label, submit, events, stream, per_layer=False, quiet=False, start_
                     f"delta_ms={mark - previous:.3f}"
                 )
                 previous = mark
-        if target is not None:
-            target_ns, arrival_ns = target
+        if sync is not None:
+            base_ns, target_ns, arrival_ns = sync
             print(
-                f"{label} sync: arrival_skew_ms="
-                f"{(arrival_ns - target_ns) / 1e6:.3f} "
+                f"{label} sync: base_ns={base_ns} target_ns={target_ns} "
+                f"arrival_skew_ms={(arrival_ns - target_ns) / 1e6:.3f} "
                 f"submit_skew_ms={(submit_ns - target_ns) / 1e6:.3f}"
             )
     return metrics
@@ -244,7 +248,7 @@ def dispatch_split(
     """Layer 0 alone, then the rest, then wait. Mirrors get_layers()."""
     for event in events:
         event.record(stream)
-    target = start_wait() if start_wait is not None else None
+    sync = start_wait() if start_wait is not None else None
     started = time.perf_counter()
     first_submit_ns = time.time_ns()
     submit_span(0, 1, [events[0].cuda_event])
@@ -260,6 +264,7 @@ def dispatch_split(
         event.synchronize()
         marks.append((time.perf_counter() - rest_returned) * 1000)
     finished = time.perf_counter()
+    finished_ns = time.time_ns()
     metrics = {
         "layer0_call_ms": (first_returned - started) * 1000,
         "rest_call_ms": (rest_returned - first_returned) * 1000,
@@ -267,6 +272,8 @@ def dispatch_split(
         "total_ms": (finished - started) * 1000,
         "marks": marks,
         "layer0_done_at_query": layer0_done_at_query,
+        "submit_ns": first_submit_ns,
+        "finished_ns": finished_ns,
     }
     if not quiet:
         print(
@@ -274,6 +281,7 @@ def dispatch_split(
             f"rest_call_ms={metrics['rest_call_ms']:.3f} "
             f"event_wait_ms={metrics['wait_ms']:.3f} "
             f"total_ms={metrics['total_ms']:.3f} "
+            f"submit_ns={first_submit_ns} finished_ns={finished_ns} "
             f"layer0_done_at_query={layer0_done_at_query}"
         )
         previous = 0.0
@@ -283,11 +291,11 @@ def dispatch_split(
                 f"delta_ms={mark - previous:.3f}"
             )
             previous = mark
-        if target is not None:
-            target_ns, arrival_ns = target
+        if sync is not None:
+            base_ns, target_ns, arrival_ns = sync
             print(
-                f"{label} sync: arrival_skew_ms="
-                f"{(arrival_ns - target_ns) / 1e6:.3f} "
+                f"{label} sync: base_ns={base_ns} target_ns={target_ns} "
+                f"arrival_skew_ms={(arrival_ns - target_ns) / 1e6:.3f} "
                 f"submit_skew_ms={(first_submit_ns - target_ns) / 1e6:.3f}"
             )
     return metrics
@@ -347,7 +355,7 @@ def launch_multi_gpu(args):
     for name in os.listdir(sync_dir):
         if name in ("go", "go.tmp", "put_done") or name.startswith("ready_"):
             os.remove(os.path.join(sync_dir, name))
-    run_token = secrets.token_hex(8)
+    run_token = args.run_token or secrets.token_hex(8)
     base = strip_option(
         sys.argv[1:],
         {
@@ -399,7 +407,7 @@ def launch_multi_gpu(args):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, go_path)
-        print(f"multi-gpu: all ready, GET target_ns={target_ns} (+200ms)")
+        print(f"multi-gpu: all ready, GET base_ns={target_ns} (+200ms)")
         for process in processes:
             code = process.wait()
             if code:
@@ -418,7 +426,8 @@ def launch_multi_gpu(args):
         print(f"===== gpu {gpu} ({log_path}) =====")
         print(Path(log_path).read_text(encoding="utf-8"))
     if failure is not None:
-        raise failure
+        print(f"multi-gpu failed: {failure!r}")
+        return 1
     return exit_code
 
 
@@ -470,6 +479,15 @@ def main():
         default=None,
         help="launch one process per GPU (e.g. 0,1,2,3); worker 0 PUTs, all GET",
     )
+    parser.add_argument(
+        "--get-stagger-ms",
+        type=float,
+        default=0.0,
+        help=(
+            "delay worker i's GET by i * N ms from one shared base "
+            "(0 = all start together)"
+        ),
+    )
     parser.add_argument("--sync-dir", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--run-token", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
@@ -489,16 +507,31 @@ def main():
     is_writer = not is_worker or args.worker_index == 0
     if is_worker and not args.sync_dir:
         parser.error("--sync-dir is set by the --gpus launcher")
+    if args.get_stagger_ms < 0:
+        parser.error("--get-stagger-ms must be >= 0")
+    if not is_worker and args.get_stagger_ms:
+        parser.error("--get-stagger-ms requires --gpus")
     sizes = tuple((size + 511) // 512 * 512 for size in logical_sizes)
     payloads = tuple(layers * pages * size for size in sizes)
     for name in ("OPEXTENSION", "GIDS_DIR"):
         if not os.environ.get(name):
             parser.error(f"set {name} for your GIDS installation")
     os.environ["GIDS_DIR"] = os.path.join(os.environ["GIDS_DIR"], "")
+    if not os.path.isabs(os.environ["GIDS_DIR"]):
+        parser.error(
+            f"GIDS_DIR must be an absolute path, got {os.environ['GIDS_DIR']!r}"
+        )
 
     config_path = gids_config_path(
         os.environ["GIDS_DIR"], args.device, os.environ.get("USE_SINGLE_PORT")
     )
+    single_port_env = os.environ.get("USE_SINGLE_PORT")
+    if not config_path.is_file():
+        parser.error(
+            f"GIDS config not found: {config_path} "
+            f"(USE_SINGLE_PORT={single_port_env!r}; unset or '1' uses "
+            f"gids_config.txt, otherwise gids_config_<device>.txt)"
+        )
     selected = (
         [int(part) for part in args.conns.split(",") if part.strip()]
         if args.conns
@@ -628,6 +661,8 @@ def main():
                 [torch.cuda.Event() for _ in range(layers)],
                 stream,
             )
+        elif is_worker:
+            print("PUT: skipped (pure reader; worker 0 is the writer)")
         if is_worker:
             touch_tag = os.path.join(args.sync_dir, "put_done")
             if args.worker_index == 0:
@@ -666,7 +701,9 @@ def main():
             touch_file(os.path.join(args.sync_dir, f"ready_{args.worker_index}"))
             run_get(
                 quiet=False,
-                start_wait=lambda: wait_for_go(args.sync_dir),
+                start_wait=lambda: wait_for_go(
+                    args.sync_dir, args.worker_index, args.get_stagger_ms
+                ),
             )
         else:
             for _ in range(args.warmup):
