@@ -546,6 +546,20 @@ class OceanDiskStorage(HiCacheStorage):
             connections[half:] = connections[:half]
             # Validate logical ranges before applying the existing direct-I/O padding.
             sizes[:] = (sizes + 511) & ~511
+        if not getattr(self, "_logged_page_io_sizes", False):
+            self._logged_page_io_sizes = True
+            first_sizes = batch[0, 1 + 4 * count : 1 + 5 * count]
+            logger.info(
+                "[OceanDisk page I/O] device=%s layer_row=0 pages=%d "
+                "kv_logical_bytes=%s kv_io_bytes=%s "
+                "index_logical_bytes=%s index_io_bytes=%s",
+                self.device,
+                half,
+                sorted({item.size for item in layers[0][:half]}),
+                np.unique(first_sizes[:half]).tolist(),
+                sorted({item.size for item in layers[0][half:]}),
+                np.unique(first_sizes[half:]).tolist(),
+            )
         return [batch]
 
     def reserve_get_metadata(self, num_layers):
