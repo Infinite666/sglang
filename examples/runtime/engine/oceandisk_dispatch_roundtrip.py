@@ -12,6 +12,7 @@ import time
 from bisect import bisect_left
 from collections import Counter
 from pathlib import Path
+from statistics import median
 
 import torch
 
@@ -90,19 +91,111 @@ def report_routing(label, rows):
     )
 
 
-def dispatch(label, submit, events, stream):
+def dispatch(label, submit, events, stream, per_layer=False, quiet=False):
     for event in events:
         event.record(stream)
     started = time.perf_counter()
     submit([event.cuda_event for event in events])
     returned = time.perf_counter()
+    marks = []
     for event in events:
         event.synchronize()
+        marks.append((time.perf_counter() - returned) * 1000)
     finished = time.perf_counter()
+    metrics = {
+        "call_ms": (returned - started) * 1000,
+        "wait_ms": (finished - returned) * 1000,
+        "total_ms": (finished - started) * 1000,
+        "marks": marks,
+    }
+    if not quiet:
+        print(
+            f"{label}: call_ms={metrics['call_ms']:.3f} "
+            f"event_wait_ms={metrics['wait_ms']:.3f} "
+            f"total_ms={metrics['total_ms']:.3f}"
+        )
+        if per_layer:
+            # Events are recorded by native after each layer's I/O on the same
+            # stream, so they complete in layer order and each sync is cumulative.
+            previous = 0.0
+            for layer, mark in enumerate(marks):
+                print(
+                    f"{label} layer={layer}: ready_ms={mark:.3f} "
+                    f"delta_ms={mark - previous:.3f}"
+                )
+                previous = mark
+    return metrics
+
+
+def dispatch_split(label, submit_span, events, stream, layers, quiet=False):
+    """Layer 0 alone, then the rest, then wait. Mirrors get_layers()."""
+    for event in events:
+        event.record(stream)
+    started = time.perf_counter()
+    submit_span(0, 1, [events[0].cuda_event])
+    first_returned = time.perf_counter()
+    if layers > 1:
+        submit_span(1, layers, [event.cuda_event for event in events[1:]])
+    rest_returned = time.perf_counter()
+    # Query happens after the second submit returns, so True only means
+    # "already complete when queried", not "complete before that return".
+    layer0_done_at_query = events[0].query()
+    marks = []
+    for event in events:
+        event.synchronize()
+        marks.append((time.perf_counter() - rest_returned) * 1000)
+    finished = time.perf_counter()
+    metrics = {
+        "layer0_call_ms": (first_returned - started) * 1000,
+        "rest_call_ms": (rest_returned - first_returned) * 1000,
+        "wait_ms": (finished - rest_returned) * 1000,
+        "total_ms": (finished - started) * 1000,
+        "marks": marks,
+        "layer0_done_at_query": layer0_done_at_query,
+    }
+    if not quiet:
+        print(
+            f"{label}: layer0_call_ms={metrics['layer0_call_ms']:.3f} "
+            f"rest_call_ms={metrics['rest_call_ms']:.3f} "
+            f"event_wait_ms={metrics['wait_ms']:.3f} "
+            f"total_ms={metrics['total_ms']:.3f} "
+            f"layer0_done_at_query={layer0_done_at_query}"
+        )
+        previous = 0.0
+        for layer, mark in enumerate(marks):
+            print(
+                f"{label} layer={layer}: ready_ms={mark:.3f} "
+                f"delta_ms={mark - previous:.3f}"
+            )
+            previous = mark
+    return metrics
+
+
+def report_get(runs, split, layers):
+    """Print medians across repeated GET measurements."""
+    totals = sorted(run["total_ms"] for run in runs)
+    waits = median(run["wait_ms"] for run in runs)
     print(
-        f"{label}: call_ms={(returned - started) * 1000:.3f} "
-        f"event_wait_ms={(finished - returned) * 1000:.3f}"
+        f"GET: runs={len(runs)} total_ms median={median(totals):.3f} "
+        f"min={totals[0]:.3f} max={totals[-1]:.3f} "
+        f"event_wait_ms median={waits:.3f}"
     )
+    if split:
+        print(
+            f"GET: layer0_call_ms median="
+            f"{median(run['layer0_call_ms'] for run in runs):.3f} "
+            f"rest_call_ms median="
+            f"{median(run['rest_call_ms'] for run in runs):.3f} "
+            f"layer0_done_at_query={runs[-1]['layer0_done_at_query']}"
+        )
+    medians = [median(run["marks"][layer] for run in runs) for layer in range(layers)]
+    previous = 0.0
+    for layer, mark in enumerate(medians):
+        print(
+            f"GET layer={layer}: ready_ms={mark:.3f} "
+            f"delta_ms={mark - previous:.3f}"
+        )
+        previous = mark
 
 
 def main():
@@ -126,11 +219,34 @@ def main():
     parser.add_argument("--kv-bytes", type=int, default=4096)
     parser.add_argument("--index-bytes", type=int, default=4096)
     parser.add_argument("--separate-pool-keys", action="store_true")
+    parser.add_argument(
+        "--split-first-layer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "GET submits layer 0 alone, then the rest, like get_layers() "
+            "(default: on; disable with --no-split-first-layer)"
+        ),
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=0,
+        help="discarded GET iterations before measuring (default: 0)",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="measured GET iterations, reported as medians (default: 1)",
+    )
     args = parser.parse_args()
     layers, pages = args.layers, args.pages
     logical_sizes = (args.kv_bytes, args.index_bytes)
     if min(layers, pages, *logical_sizes) <= 0:
         parser.error("layers, pages and pool sizes must be positive")
+    if args.warmup < 0 or args.repeat <= 0:
+        parser.error("--warmup must be >= 0 and --repeat must be > 0")
     sizes = tuple((size + 511) // 512 * 512 for size in logical_sizes)
     payloads = tuple(layers * pages * size for size in sizes)
     for name in ("OPEXTENSION", "GIDS_DIR"):
@@ -243,6 +359,24 @@ def main():
         lengths = torch.full((layers,), width, dtype=torch.int64)
         indices = torch.arange(layers, dtype=torch.int64)
         tail = (stream.stream_id, args.device, 0, layers, True, False)
+
+        def submit_span(first, last, event_handles):
+            # Local slices plus start_layer=0: native indexes CPU task IDs and
+            # GPU rows locally, so a nonzero start layer would misalign them.
+            od_utils.batch_dispatch_get(
+                get_gpu[first:last],
+                width,
+                get_cpu[first:last],
+                output,
+                event_handles,
+                stream.stream_id,
+                args.device,
+                0,
+                last - first,
+                True,
+                False,
+            )
+
         dispatch(
             "PUT",
             lambda events: od_utils.batch_dispatch_put(
@@ -251,14 +385,28 @@ def main():
             [torch.cuda.Event() for _ in range(layers)],
             stream,
         )
-        dispatch(
-            "GET",
-            lambda events: od_utils.batch_dispatch_get(
-                get_gpu, width, get_cpu, output, events, *tail
-            ),
-            [torch.cuda.Event() for _ in range(layers)],
-            stream,
-        )
+        def run_get(quiet):
+            events = [torch.cuda.Event() for _ in range(layers)]
+            if args.split_first_layer:
+                return dispatch_split(
+                    "GET", submit_span, events, stream, layers, quiet=quiet
+                )
+            return dispatch(
+                "GET",
+                lambda event_handles: submit_span(0, layers, event_handles),
+                events,
+                stream,
+                per_layer=True,
+                quiet=quiet,
+            )
+
+        for _ in range(args.warmup):
+            run_get(quiet=True)
+        if args.repeat == 1:
+            run_get(quiet=False)
+        else:
+            runs = [run_get(quiet=True) for _ in range(args.repeat)]
+            report_get(runs, args.split_first_layer, layers)
 
     for pool, (buffer, source, size) in enumerate(zip(buffers, sources, sizes)):
         payload_bytes = source.numel()
