@@ -1,13 +1,26 @@
-"""Standalone GIDS PUT/GET byte round trip with configurable layers, pages and pool sizes.
+"""Standalone GIDS PUT/GET byte round trip with configurable layers, pages and
+pool sizes.
 
 Set OPEXTENSION and GIDS_DIR for the native installation. Run with Python
 in an environment containing CUDA PyTorch and od_utils. This writes fresh
 test keys to the configured GIDS namespace.
+
+Single GPU:
+    python oceandisk_dispatch_roundtrip.py --layers 78 --pages 100 ...
+
+Multi-GPU pure-read comparison (one process per GPU, same keys, aligned GET):
+    python oceandisk_dispatch_roundtrip.py --gpus 0,1,2,3 --layers 78 ...
+Worker 0 performs PUT; every worker then reads the same objects at the same
+wall-clock instant so per-layer deltas can be compared across cards.
 """
 
 import argparse
+import hashlib
 import os
 import secrets
+import subprocess
+import sys
+import tempfile
 import time
 from bisect import bisect_left
 from collections import Counter
@@ -15,6 +28,95 @@ from pathlib import Path
 from statistics import median
 
 import torch
+
+
+def derive_keys(run_token, pool, count):
+    """Deterministic per-run keys shared by every worker process."""
+    keys, seen = [], set()
+    index = 0
+    while len(keys) < count:
+        digest = hashlib.sha256(f"{run_token}:{pool}:{index}".encode()).digest()
+        key = int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+        index += 1
+        if key == 0 or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
+
+
+CHUNK_BYTES = 64 << 20
+
+
+def expected_chunk(seed, pool, chunk_index, count):
+    """Deterministic payload bytes; writer fill and verification share this."""
+    generator = torch.Generator().manual_seed(
+        (seed * 1_000_003 + pool * 97_409 + chunk_index) & 0x7FFFFFFF
+    )
+    return torch.randint(0, 256, (count,), generator=generator, dtype=torch.uint8)
+
+
+def fill_source(buffer, seed, pool, payload):
+    offset = chunk_index = 0
+    while offset < payload:
+        count = min(CHUNK_BYTES, payload - offset)
+        buffer[offset : offset + count].copy_(
+            expected_chunk(seed, pool, chunk_index, count)
+        )
+        offset += count
+        chunk_index += 1
+
+
+def verify_region(region, seed, pool, payload, size, pages):
+    offset = chunk_index = 0
+    while offset < payload:
+        count = min(CHUNK_BYTES, payload - offset)
+        expected = expected_chunk(seed, pool, chunk_index, count)
+        actual = region[offset : offset + count].cpu()
+        mismatch = (actual != expected).nonzero(as_tuple=True)[0]
+        if mismatch.numel():
+            position = int(mismatch[0])
+            absolute = offset + position
+            layer, page = divmod(absolute // size, pages)
+            raise RuntimeError(
+                f"pool={pool} layer={layer} page={page} "
+                f"byte={absolute % size}: expected={int(expected[position])} "
+                f"actual={int(actual[position])}"
+            )
+        offset += count
+        chunk_index += 1
+
+
+def wait_for_file(path, timeout, processes=None):
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(path):
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"timed out after {timeout:.0f}s waiting for {path}")
+        for process in processes or ():
+            if process.poll() is not None and process.returncode != 0:
+                raise RuntimeError(
+                    f"worker exited early with code {process.returncode}"
+                )
+        time.sleep(0.001)
+
+
+def touch_file(path):
+    Path(path).write_text(str(os.getpid()), encoding="utf-8")
+
+
+def wait_for_go(sync_dir):
+    """Busy-wait until the launcher's shared start timestamp."""
+    path = os.path.join(sync_dir, "go")
+    wait_for_file(path, timeout=600)
+    target = int(Path(path).read_text(encoding="utf-8").strip())
+    while True:
+        remaining = (target - time.time_ns()) / 1e9
+        if remaining <= 0:
+            break
+        if remaining > 0.002:
+            time.sleep(remaining - 0.002)
+    detected = time.time_ns()
+    return target, detected
 
 
 def gids_config_path(config_dir, device_index, use_single_port):
@@ -91,10 +193,12 @@ def report_routing(label, rows):
     )
 
 
-def dispatch(label, submit, events, stream, per_layer=False, quiet=False):
+def dispatch(label, submit, events, stream, per_layer=False, quiet=False, start_wait=None):
     for event in events:
         event.record(stream)
+    target = start_wait() if start_wait is not None else None
     started = time.perf_counter()
+    submit_ns = time.time_ns()
     submit([event.cuda_event for event in events])
     returned = time.perf_counter()
     marks = []
@@ -124,14 +228,25 @@ def dispatch(label, submit, events, stream, per_layer=False, quiet=False):
                     f"delta_ms={mark - previous:.3f}"
                 )
                 previous = mark
+        if target is not None:
+            target_ns, arrival_ns = target
+            print(
+                f"{label} sync: arrival_skew_ms="
+                f"{(arrival_ns - target_ns) / 1e6:.3f} "
+                f"submit_skew_ms={(submit_ns - target_ns) / 1e6:.3f}"
+            )
     return metrics
 
 
-def dispatch_split(label, submit_span, events, stream, layers, quiet=False):
+def dispatch_split(
+    label, submit_span, events, stream, layers, quiet=False, start_wait=None
+):
     """Layer 0 alone, then the rest, then wait. Mirrors get_layers()."""
     for event in events:
         event.record(stream)
+    target = start_wait() if start_wait is not None else None
     started = time.perf_counter()
+    first_submit_ns = time.time_ns()
     submit_span(0, 1, [events[0].cuda_event])
     first_returned = time.perf_counter()
     if layers > 1:
@@ -168,6 +283,13 @@ def dispatch_split(label, submit_span, events, stream, layers, quiet=False):
                 f"delta_ms={mark - previous:.3f}"
             )
             previous = mark
+        if target is not None:
+            target_ns, arrival_ns = target
+            print(
+                f"{label} sync: arrival_skew_ms="
+                f"{(arrival_ns - target_ns) / 1e6:.3f} "
+                f"submit_skew_ms={(first_submit_ns - target_ns) / 1e6:.3f}"
+            )
     return metrics
 
 
@@ -196,6 +318,108 @@ def report_get(runs, split, layers):
             f"delta_ms={mark - previous:.3f}"
         )
         previous = mark
+
+
+def strip_option(argv, names):
+    result, skip = [], False
+    for token in argv:
+        if skip:
+            skip = False
+            continue
+        if token in names:
+            skip = True
+            continue
+        if any(token.startswith(name + "=") for name in names):
+            continue
+        result.append(token)
+    return result
+
+
+def launch_multi_gpu(args):
+    """One process per GPU. Worker 0 PUTs, all workers then GET in lockstep."""
+    gpus = [int(part) for part in args.gpus.split(",") if part.strip()]
+    if not gpus or len(set(gpus)) != len(gpus):
+        raise SystemExit("--gpus must list distinct GPU indices, e.g. 0,1,2,3")
+    if args.repeat != 1:
+        raise SystemExit("multi-GPU mode runs one aligned GET; keep --repeat 1")
+    sync_dir = args.sync_dir or tempfile.mkdtemp(prefix="oceandisk-multigpu-")
+    os.makedirs(sync_dir, exist_ok=True)
+    for name in os.listdir(sync_dir):
+        if name in ("go", "go.tmp", "put_done") or name.startswith("ready_"):
+            os.remove(os.path.join(sync_dir, name))
+    run_token = secrets.token_hex(8)
+    base = strip_option(
+        sys.argv[1:],
+        {
+            "--gpus",
+            "--device",
+            "--sync-dir",
+            "--run-token",
+            "--worker-index",
+            "--workers",
+        },
+    )
+    print(f"multi-gpu: gpus={gpus} sync_dir={sync_dir} run_token={run_token}")
+
+    logs, processes = [], []
+    exit_code, failure = 0, None
+    try:
+        for index, gpu in enumerate(gpus):
+            log_path = os.path.join(sync_dir, f"gpu_{gpu}.log")
+            handle = open(log_path, "w", encoding="utf-8")
+            command = [
+                sys.executable,
+                "-u",
+                os.path.abspath(__file__),
+                *base,
+                "--device",
+                str(gpu),
+                "--worker-index",
+                str(index),
+                "--workers",
+                str(len(gpus)),
+                "--sync-dir",
+                sync_dir,
+                "--run-token",
+                run_token,
+            ]
+            processes.append(
+                subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT)
+            )
+            logs.append((gpu, log_path, handle))
+        wait_for_file(os.path.join(sync_dir, "put_done"), 900, processes)
+        for index in range(len(gpus)):
+            wait_for_file(os.path.join(sync_dir, f"ready_{index}"), 900, processes)
+        target_ns = time.time_ns() + 200_000_000
+        # Publish atomically: a plain open+write exposes an empty file first.
+        go_path = os.path.join(sync_dir, "go")
+        temp_path = go_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            handle.write(str(target_ns))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, go_path)
+        print(f"multi-gpu: all ready, GET target_ns={target_ns} (+200ms)")
+        for process in processes:
+            code = process.wait()
+            if code:
+                exit_code = code
+    except BaseException as error:
+        failure = error
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait()
+        for _, _, handle in logs:
+            handle.close()
+
+    for gpu, log_path, _ in logs:
+        print(f"===== gpu {gpu} ({log_path}) =====")
+        print(Path(log_path).read_text(encoding="utf-8"))
+    if failure is not None:
+        raise failure
+    return exit_code
 
 
 def main():
@@ -240,6 +464,18 @@ def main():
         default=1,
         help="measured GET iterations, reported as medians (default: 1)",
     )
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help="launch one process per GPU (e.g. 0,1,2,3); worker 0 PUTs, all GET",
+    )
+    parser.add_argument("--sync-dir", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--run-token", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--worker-index", type=int, default=None, help=argparse.SUPPRESS
+    )
+    parser.add_argument("--workers", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     layers, pages = args.layers, args.pages
     logical_sizes = (args.kv_bytes, args.index_bytes)
@@ -247,6 +483,12 @@ def main():
         parser.error("layers, pages and pool sizes must be positive")
     if args.warmup < 0 or args.repeat <= 0:
         parser.error("--warmup must be >= 0 and --repeat must be > 0")
+    if args.gpus and args.worker_index is None:
+        return launch_multi_gpu(args)
+    is_worker = args.worker_index is not None
+    is_writer = not is_worker or args.worker_index == 0
+    if is_worker and not args.sync_dir:
+        parser.error("--sync-dir is set by the --gpus launcher")
     sizes = tuple((size + 511) // 512 * 512 for size in logical_sizes)
     payloads = tuple(layers * pages * size for size in sizes)
     for name in ("OPEXTENSION", "GIDS_DIR"):
@@ -273,18 +515,15 @@ def main():
     torch.ops.load_library(os.environ["OPEXTENSION"])
     import od_utils
 
-    generator = torch.Generator().manual_seed(args.seed)
-    sources = [
-        torch.randint(0, 256, (payload_bytes,), generator=generator, dtype=torch.uint8)
-        for payload_bytes in payloads
-    ]
-    # One registered region per pool, with disjoint source and destination halves.
+    pure_reader = is_worker and not is_writer
+    regions = 1 if pure_reader else 2
     buffers = [
-        torch.full((2 * payload_bytes + 512,), 0xA5, device=device, dtype=torch.uint8)
-        for payload_bytes in payloads
+        torch.full((regions * payload + 512,), 0xA5, device=device, dtype=torch.uint8)
+        for payload in payloads
     ]
-    for buffer, source in zip(buffers, sources):
-        buffer[:source.numel()].copy_(source)
+    if not pure_reader:
+        for pool, buffer in enumerate(buffers):
+            fill_source(buffer, args.seed, pool, payloads[pool])
 
     registration = torch.tensor(
         [b.data_ptr() for b in buffers] + [b.numel() for b in buffers],
@@ -292,27 +531,22 @@ def main():
         device=device,
     )
     output = torch.zeros(2, dtype=torch.int64, device=device)
+    if is_worker:
+        # Match the production linker: stagger GIDS connection setup by GPU.
+        time.sleep(args.device * 2)
     status = torch.ops.my_ops.kvcache_init(registration, output)
     torch.cuda.synchronize(device)
     if status != 0:
         raise RuntimeError(f"kvcache_init failed: {status}")
 
-    # Production keys are hashed page identities, i.e. uniformly spread over
-    # the DPU ring. Consecutive integers almost always stay inside one ring
-    # segment, so generate uniform 63-bit keys instead.
-    def random_keys(count, taken):
-        keys = []
-        while len(keys) < count:
-            key = 1 + secrets.randbelow((1 << 63) - 1)
-            if key in taken:
-                continue
-            taken.add(key)
-            keys.append(key)
-        return keys
-
-    taken = set()
-    kv_keys = random_keys(pages, taken)
-    index_keys = random_keys(pages, taken) if args.separate_pool_keys else kv_keys
+    # Production keys are hashed page identities, uniformly spread over the
+    # DPU ring. Every worker in multi-GPU mode derives the same key set from
+    # one run token, so all of them read the same objects.
+    run_token = args.run_token or secrets.token_hex(8)
+    kv_keys = derive_keys(run_token, "kv", pages)
+    index_keys = (
+        derive_keys(run_token, "index", pages) if args.separate_pool_keys else kv_keys
+    )
     keys = kv_keys + index_keys
     if args.conn is not None:
         conns = [args.conn] * len(keys)
@@ -322,8 +556,12 @@ def main():
         # Production fixes one connection per page for both KV/Indexer halves.
         conns = [select_conn(key) for key in keys[:pages]] * 2
     print(
-        f"layers={layers} pages={pages} logical_pool_bytes={logical_sizes} "
-        f"aligned_pool_bytes={sizes} bytes_per_direction={sum(payloads)} "
+        f"device={args.device} worker={args.worker_index}/{args.workers} "
+        f"writer={is_writer} pure_reader={pure_reader} "
+        f"layers={layers} pages={pages} "
+        f"logical_pool_bytes={logical_sizes} aligned_pool_bytes={sizes} "
+        f"bytes_per_direction={sum(payloads)} chunk_bytes={CHUNK_BYTES} "
+        f"run_token={run_token} "
         f"kv_first_key={kv_keys[0]} index_first_key={index_keys[0]} "
         f"seed={args.seed} config={config_path} connections={available} "
         f"dpus={dpu_ids} routed={dict(sorted(Counter(conns).items()))}"
@@ -332,10 +570,14 @@ def main():
 
     def metadata(destination, first_task):
         rows = []
+        # Pure readers register only the destination region, so their GET
+        # offsets start at 0; the writer keeps source at 0 and destination at
+        # payload.
         for layer in range(layers):
             local_offsets = [
-                (payload if destination else 0) + (layer * pages + page) * size
-                for size, payload in zip(sizes, payloads)
+                (0 if not destination or pure_reader else payloads[pool])
+                + (layer * pages + page) * size
+                for pool, size in enumerate(sizes)
                 for page in range(pages)
             ]
             rows.append(
@@ -377,19 +619,34 @@ def main():
                 False,
             )
 
-        dispatch(
-            "PUT",
-            lambda events: od_utils.batch_dispatch_put(
-                put_gpu, lengths, indices, put_cpu, output, events, *tail
-            ),
-            [torch.cuda.Event() for _ in range(layers)],
-            stream,
-        )
-        def run_get(quiet):
+        if is_writer:
+            dispatch(
+                "PUT",
+                lambda events: od_utils.batch_dispatch_put(
+                    put_gpu, lengths, indices, put_cpu, output, events, *tail
+                ),
+                [torch.cuda.Event() for _ in range(layers)],
+                stream,
+            )
+        if is_worker:
+            touch_tag = os.path.join(args.sync_dir, "put_done")
+            if args.worker_index == 0:
+                torch.cuda.synchronize(device)
+                touch_file(touch_tag)
+            else:
+                wait_for_file(touch_tag, timeout=900)
+
+        def run_get(quiet, start_wait=None):
             events = [torch.cuda.Event() for _ in range(layers)]
             if args.split_first_layer:
                 return dispatch_split(
-                    "GET", submit_span, events, stream, layers, quiet=quiet
+                    "GET",
+                    submit_span,
+                    events,
+                    stream,
+                    layers,
+                    quiet=quiet,
+                    start_wait=start_wait,
                 )
             return dispatch(
                 "GET",
@@ -398,29 +655,35 @@ def main():
                 stream,
                 per_layer=True,
                 quiet=quiet,
+                start_wait=start_wait,
             )
 
-        for _ in range(args.warmup):
-            run_get(quiet=True)
-        if args.repeat == 1:
-            run_get(quiet=False)
+        if is_worker:
+            # Read-only workers join at the shared start point; worker 0 already
+            # published put_done, so the data exists for every warmup read.
+            for _ in range(args.warmup):
+                run_get(quiet=True)
+            touch_file(os.path.join(args.sync_dir, f"ready_{args.worker_index}"))
+            run_get(
+                quiet=False,
+                start_wait=lambda: wait_for_go(args.sync_dir),
+            )
         else:
-            runs = [run_get(quiet=True) for _ in range(args.repeat)]
-            report_get(runs, args.split_first_layer, layers)
+            for _ in range(args.warmup):
+                run_get(quiet=True)
+            if args.repeat == 1:
+                run_get(quiet=False)
+            else:
+                runs = [run_get(quiet=True) for _ in range(args.repeat)]
+                report_get(runs, args.split_first_layer, layers)
 
-    for pool, (buffer, source, size) in enumerate(zip(buffers, sources, sizes)):
-        payload_bytes = source.numel()
-        actual = buffer[payload_bytes : 2 * payload_bytes].cpu()
-        mismatch = (actual != source).nonzero(as_tuple=True)[0]
-        if mismatch.numel():
-            offset = mismatch[0].item()
-            layer, page = divmod(offset // size, pages)
-            raise RuntimeError(
-                f"pool={pool} layer={layer} page={page} byte={offset % size}: "
-                f"expected={source[offset].item()} actual={actual[offset].item()}"
-            )
+    for pool, (buffer, size, payload) in enumerate(zip(buffers, sizes, payloads)):
+        prefix = 0 if pure_reader else payload
+        verify_region(
+            buffer[prefix : prefix + payload], args.seed, pool, payload, size, pages
+        )
     print(f"PASS: verified {sum(payloads)} bytes")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
