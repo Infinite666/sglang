@@ -63,6 +63,33 @@ def load_connection_selector(config_path, selected=None):
     return select, available, sorted(groups)
 
 
+def report_routing(label, rows):
+    """Read the metadata tensor native consumes and print its conn column."""
+    count = (rows.shape[1] - 1) // 6
+    keys = rows[:, 1 + count : 1 + 2 * count]
+    sizes = rows[:, 1 + 4 * count : 1 + 5 * count]
+    conns = rows[:, 1 + 5 * count : 1 + 6 * count]
+    per_layer = [tuple(row) for row in conns.tolist()]
+    if len(set(per_layer)) != 1:
+        raise RuntimeError(f"{label}: connection column differs across layers")
+    per_conn_bytes = Counter()
+    for _, conn, size in zip(
+        keys[0].tolist(), conns[0].tolist(), sizes[0].tolist()
+    ):
+        per_conn_bytes[conn] += size
+    pairs = list(zip(keys[0].tolist(), conns[0].tolist()))
+    print(
+        f"{label}: io_per_layer={count} "
+        f"conns_per_layer={dict(sorted(Counter(conns[0].tolist()).items()))} "
+        f"bytes_per_conn={dict(sorted(per_conn_bytes.items()))} "
+        f"max_conn={max(conns[0].tolist(), default=-1)}"
+    )
+    print(
+        f"{label}: key->conn sample="
+        f"{pairs[:8]}{' ...' if len(pairs) > 8 else ''}"
+    )
+
+
 def dispatch(label, submit, events, stream):
     for event in events:
         event.record(stream)
@@ -200,6 +227,8 @@ def main():
     with torch.cuda.stream(stream):
         put_cpu = metadata(False, 1)
         get_cpu = metadata(True, 1 + layers)
+        report_routing("PUT", put_cpu)
+        report_routing("GET", get_cpu)
         put_gpu, get_gpu = put_cpu.to(device), get_cpu.to(device)
         width = put_cpu.shape[1]
         lengths = torch.full((layers,), width, dtype=torch.int64)
