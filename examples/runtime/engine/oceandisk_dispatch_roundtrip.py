@@ -663,10 +663,12 @@ def main():
             )
         elif is_worker:
             print("PUT: skipped (pure reader; worker 0 is the writer)")
+            if is_worker:
+                torch.cuda.synchronize(device)
+            time.sleep(10)
         if is_worker:
             touch_tag = os.path.join(args.sync_dir, "put_done")
-            if args.worker_index == 0:
-                torch.cuda.synchronize(device)
+            if is_writer:
                 touch_file(touch_tag)
             else:
                 wait_for_file(touch_tag, timeout=900)
