@@ -479,11 +479,12 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             bitmap = self.storage.exists_many(keys, timings=timings)
             logger.info(
                 "[OceanDisk PERF LOOKUP] rid=%s pages=%d "
-                "put_lock_ms=%.3f "
+                "pending_offload_at_lookup=%d put_lock_ms=%.3f "
                 "put_sync_ms=%.3f exists_ms=%.3f exists_prepare_ms=%.3f "
                 "exists_native_ms=%.3f probe_ms=%.3f",
                 rid,
                 len(keys),
+                pending_at_lookup,
                 timings["put_lock_ms"],
                 timings["put_sync_ms"],
                 timings["exists_ms"],
