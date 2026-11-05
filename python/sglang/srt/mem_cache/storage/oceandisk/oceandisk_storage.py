@@ -385,17 +385,24 @@ class OceanDiskStorage(HiCacheStorage):
         individual key statuses. Entries after the first miss remain False.
         """
         torch = self._torch
-        # Metadata uses the querying thread's current stream.
+        # Native EXISTS parses metadata on CPU; keep it there to avoid a GPU roundtrip.
         with torch.cuda.device(self.device):
             self._ensure_open()
             if timings is not None:
                 timings.update(
-                    exists_prepare_ms=0.0, exists_native_ms=0.0, probe_ms=0.0
+                    exists_prepare_ms=0.0,
+                    exists_route_ms=0.0,
+                    exists_metadata_ms=0.0,
+                    exists_native_ms=0.0,
+                    probe_ms=0.0,
                 )
                 prepare_start = time.perf_counter()
             if not keys:
                 return []
             connections = [self.connection_router.select(key) for key in keys]
+            if timings is not None:
+                route_done = time.perf_counter()
+                timings["exists_route_ms"] = (route_done - prepare_start) * 1000
             if os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1":
                 logger.info(
                     "[OceanDisk connection usage] pid=%d device=%s keys=%d counts=%s",
@@ -410,12 +417,12 @@ class OceanDiskStorage(HiCacheStorage):
             metadata = torch.tensor(
                 [next(self._task_ids), *keys, *connections],
                 dtype=torch.int64,
-                device=self.device,
+                device="cpu",
             )
             if timings is not None:
-                timings["exists_prepare_ms"] = (
-                    time.perf_counter() - prepare_start
-                ) * 1000
+                metadata_done = time.perf_counter()
+                timings["exists_metadata_ms"] = (metadata_done - route_done) * 1000
+                timings["exists_prepare_ms"] = (metadata_done - prepare_start) * 1000
                 native_start = time.perf_counter()
             prefix_hits = self._ops.kvcache_exist(metadata, self._output)
             if timings is not None:
@@ -438,7 +445,7 @@ class OceanDiskStorage(HiCacheStorage):
                 probe = torch.tensor(
                     [next(self._task_ids), key, conn],
                     dtype=torch.int64,
-                    device=self.device,
+                    device="cpu",
                 )
                 single_hit = self._ops.kvcache_exist(probe, self._output)
             except Exception as error:
@@ -602,6 +609,7 @@ class OceanDiskStorage(HiCacheStorage):
         layers,
         *,
         on_layer_ready=None,
+        on_layers_dispatched=None,
         timings=None,
         perf_context=None,
     ) -> None:
@@ -681,6 +689,21 @@ class OceanDiskStorage(HiCacheStorage):
                             self._get_stream,
                         )
                         native_times.append((time.perf_counter() - step) * 1000)
+                    if on_layers_dispatched is not None:
+                        # The native wrapper records each layer's event after
+                        # enqueueing its I/O, so once the call returns the
+                        # events are safe to hand to the compute thread. This
+                        # runs before the host waits below: the compute stream
+                        # then depends on the event directly and the forward
+                        # thread no longer parks per layer.
+                        on_layers_dispatched(
+                            first,
+                            last,
+                            [
+                                tuple(events[layer] for _, _, events in submitted)
+                                for layer in range(first, last)
+                            ],
+                        )
                 if perf_context is not None:
                     submit_pending_end = pending_puts()
                     # KV and Indexer use the same route. Count only the KV half
