@@ -286,6 +286,14 @@ class OceanDiskStorage(HiCacheStorage):
             self._get_stream = torch.cuda.Stream(device=self.device)
             self._put_stream = torch.cuda.Stream(device=self.device)
             self._output = torch.zeros(2, dtype=torch.int64, device=self.device)
+            # Match the old controller's reusable EXISTS metadata buffers.
+            self._exists_metadata_cpu = torch.empty(
+                GET_METADATA_WIDTH, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            self._exists_metadata_np = self._exists_metadata_cpu.numpy()
+            self._exists_metadata_gpu = torch.empty(
+                GET_METADATA_WIDTH, dtype=torch.int64, device=self.device
+            )
             addresses, lengths = zip(*self.regions)
             # Match the old controller's MR extension for direct padded I/O.
             # This extends registration only; it does not allocate trailing memory.
@@ -378,6 +386,23 @@ class OceanDiskStorage(HiCacheStorage):
                     timings["exists_ms"] = (time.perf_counter() - started) * 1000
                 return result
 
+    def _prepare_exists_metadata(self, keys, connections):
+        # Caller holds _put_io_lock through the synchronous native query.
+        count = len(keys)
+        width = 1 + 2 * count
+        if width > self._exists_metadata_cpu.numel():
+            raise ValueError(
+                f"OceanDisk EXISTS metadata needs {width} int64 values; "
+                f"capacity is {self._exists_metadata_cpu.numel()}."
+            )
+        values = self._exists_metadata_np
+        values[0] = next(self._task_ids)
+        values[1 : 1 + count] = keys
+        values[1 + count : width] = connections
+        gpu = self._exists_metadata_gpu[:width]
+        gpu.copy_(self._exists_metadata_cpu[:width], non_blocking=True)
+        return gpu
+
     def _exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
         """Return a prefix-only bitmap from one native batch existence query.
 
@@ -414,11 +439,7 @@ class OceanDiskStorage(HiCacheStorage):
                         for index in self.connection_indices
                     },
                 )
-            metadata = torch.tensor(
-                [next(self._task_ids), *keys, *connections],
-                dtype=torch.int64,
-                device=self.device,
-            )
+            metadata = self._prepare_exists_metadata(keys, connections)
             if timings is not None:
                 metadata_done = time.perf_counter()
                 timings["exists_metadata_ms"] = (metadata_done - route_done) * 1000
@@ -442,11 +463,7 @@ class OceanDiskStorage(HiCacheStorage):
             conn = connections[prefix_hits]
             put_record = self._debug_put_history.get(key)
             try:
-                probe = torch.tensor(
-                    [next(self._task_ids), key, conn],
-                    dtype=torch.int64,
-                    device=self.device,
-                )
+                probe = self._prepare_exists_metadata([key], [conn])
                 single_hit = self._ops.kvcache_exist(probe, self._output)
             except Exception as error:
                 single_hit = repr(error)
