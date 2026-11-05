@@ -626,7 +626,6 @@ class OceanDiskStorage(HiCacheStorage):
         layers,
         *,
         on_layer_ready=None,
-        on_layers_dispatched=None,
         timings=None,
         perf_context=None,
     ) -> None:
@@ -706,21 +705,6 @@ class OceanDiskStorage(HiCacheStorage):
                             self._get_stream,
                         )
                         native_times.append((time.perf_counter() - step) * 1000)
-                    if on_layers_dispatched is not None:
-                        # The native wrapper records each layer's event after
-                        # enqueueing its I/O, so once the call returns the
-                        # events are safe to hand to the compute thread. This
-                        # runs before the host waits below: the compute stream
-                        # then depends on the event directly and the forward
-                        # thread no longer parks per layer.
-                        on_layers_dispatched(
-                            first,
-                            last,
-                            [
-                                tuple(events[layer] for _, _, events in submitted)
-                                for layer in range(first, last)
-                            ],
-                        )
                 if perf_context is not None:
                     submit_pending_end = pending_puts()
                     # KV and Indexer use the same route. Count only the KV half

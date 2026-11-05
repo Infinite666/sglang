@@ -119,24 +119,6 @@ class LayerwiseSaveSession:
         self.ready_events.clear()
 
 
-class _LayerLoadSlot:
-    """Per-task handoff between the load worker and the compute thread.
-
-    ``events[layer]`` carries the CUDA event the native wrapper recorded after
-    enqueueing that layer's I/O, and ``dispatched[layer]`` gates access to it.
-    The gate matters because ``cudaStreamWaitEvent`` treats a never-recorded
-    event as already complete; without it the compute thread could skip the
-    wait and read a partially loaded layer.
-    """
-
-    __slots__ = ("dispatched", "error", "events")
-
-    def __init__(self, num_layers: int):
-        self.events: list[tuple[torch.cuda.Event, ...] | None] = [None] * num_layers
-        self.dispatched = [threading.Event() for _ in range(num_layers)]
-        self.error: BaseException | None = None
-
-
 class LayerWiseLoadCounter:
     """Resolve layers only after every physical pool in that layer is readable."""
 
@@ -144,67 +126,36 @@ class LayerWiseLoadCounter:
         self.num_layers = num_layers
         self.producer_index = -1
         self.consumer_index = -1
-        self.slots: dict[int, _LayerLoadSlot] = {}
+        self.futures: dict[int, list[Future]] = {}
         self._perf_waits = {}
 
     def update_producer(self) -> int:
         self.producer_index += 1
-        self.slots[self.producer_index] = _LayerLoadSlot(self.num_layers)
+        self.futures[self.producer_index] = [Future() for _ in range(self.num_layers)]
         return self.producer_index
 
     def set_consumer(self, index: int) -> None:
         self.consumer_index = index
 
-    def publish(self, index: int, first: int, last: int, events) -> None:
-        """Hand recorded events to the compute thread without waiting on them.
-
-        Called right after the native dispatch returns, so every event in
-        ``[first, last)`` is already recorded on the load stream.
-        """
-        slot = self.slots.get(index)
-        if slot is None:
-            return
-        for layer in range(first, last):
-            slot.events[layer] = tuple(events[layer - first])
-            slot.dispatched[layer].set()
-
     def complete(self, index: int, layer: int) -> None:
-        """Release a layer that has no published event (perf skip path)."""
-        slot = self.slots.get(index)
-        if slot is None or slot.dispatched[layer].is_set():
-            return
-        slot.dispatched[layer].set()
+        self.futures[index][layer].set_result(None)
 
     def fail(self, index: int, error: BaseException) -> None:
-        # Wake every waiter so the gate can carry the failure instead of
-        # letting compute proceed with unloaded KV.
-        slot = self.slots.get(index)
-        if slot is not None:
-            slot.error = error
-            for gate in slot.dispatched:
-                gate.set()
+        for future in self.futures.get(index, ()):
+            if not future.done():
+                future.set_exception(error)
 
     def wait_until(self, threshold: int) -> None:
         index = self.consumer_index
-        slot = self.slots.get(index)
-        if slot is None:
+        futures = self.futures.get(index)
+        if futures is None:
             return
         perf_trace = os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
         wait_start = time.perf_counter() if perf_trace else 0.0
         try:
-            slot.dispatched[threshold].wait()
-            if slot.error is not None:
-                raise RuntimeError(
-                    "OceanDisk layer-wise KV load failed."
-                ) from slot.error
-            # The forward thread's current stream is the one that reads this
-            # layer's KV/Indexer, so a stream dependency is enough to keep the
-            # host running ahead instead of parking per layer.
-            events = slot.events[threshold]
-            if events:
-                stream = torch.cuda.current_stream()
-                for event in events:
-                    stream.wait_event(event)
+            futures[threshold].result()
+        except BaseException as error:
+            raise RuntimeError("OceanDisk layer-wise KV load failed.") from error
         finally:
             if perf_trace:
                 wait_ms = (time.perf_counter() - wait_start) * 1000
@@ -212,8 +163,7 @@ class LayerWiseLoadCounter:
                 if threshold not in waits:
                     waits[threshold] = wait_ms
                     logger.info(
-                        "[OceanDisk PERF LOAD WAIT] task=%d layer=%d wait_ms=%.3f "
-                        "mode=gpu_event",
+                        "[OceanDisk PERF LOAD WAIT] task=%d layer=%d wait_ms=%.3f",
                         index,
                         threshold,
                         wait_ms,
@@ -221,11 +171,11 @@ class LayerWiseLoadCounter:
                 if threshold == self.num_layers - 1:
                     self._perf_waits.pop(index, None)
             if threshold == self.num_layers - 1:
-                self.slots.pop(index, None)
+                self.futures.pop(index, None)
 
     def reset(self) -> None:
         self.producer_index = self.consumer_index = -1
-        self.slots.clear()
+        self.futures.clear()
         self._perf_waits.clear()
 
 
@@ -769,13 +719,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                     if counter_index is None
                     else lambda layer: self.layer_done_counter.complete(
                         counter_index, layer
-                    )
-                ),
-                on_layers_dispatched=(
-                    None
-                    if counter_index is None
-                    else lambda first, last, events: self.layer_done_counter.publish(
-                        counter_index, first, last, events
                     )
                 ),
                 **perf_kwargs,
