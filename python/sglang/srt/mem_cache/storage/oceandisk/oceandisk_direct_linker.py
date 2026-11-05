@@ -557,7 +557,32 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         event = self._ready_event()
         index = self.layer_done_counter.update_producer()
         pending, self.pending_loads = self.pending_loads, {}
-        self.load_queue.put((index, pending, event))
+        try:
+            event.synchronize()
+            continuation = None
+            if not getattr(self, "_skip_get_for_perf", False):
+                layers = self._transfer_layers(
+                    [t for transfers in pending.values() for t in transfers]
+                )
+                if layers and layers[0]:
+                    continuation = self.storage.get_layers(
+                        layers,
+                        on_layer_ready=lambda layer: self.layer_done_counter.complete(
+                            index, layer
+                        ),
+                        perf_context=(index, self.pending_offload_tasks)
+                        if os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
+                        else None,
+                        defer_remaining=True,
+                    )
+            if continuation is None:
+                for layer in range(self.num_layers):
+                    self.layer_done_counter.complete(index, layer)
+        except BaseException as error:
+            self.layer_done_counter.fail(index, error)
+            self.completed_loads.put(list(pending))
+            raise
+        self.load_queue.put((index, pending, continuation))
         trace_event("LOAD_STARTED", counter=index, rids=list(pending))
         return index
 
@@ -731,14 +756,10 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 try:
                     if task is None:
                         return
-                    index, pending, event = task
+                    index, pending, continuation = task
                     try:
-                        event.synchronize()
-                        self._run_transfers(
-                            [t for transfers in pending.values() for t in transfers],
-                            write=False,
-                            counter_index=index,
-                        )
+                        if continuation is not None:
+                            continuation()
                         trace_event("LOAD_DONE", counter=index, rids=list(pending))
                     except BaseException as error:
                         self.layer_done_counter.fail(index, error)

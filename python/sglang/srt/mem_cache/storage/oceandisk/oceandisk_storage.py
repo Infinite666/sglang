@@ -628,8 +628,9 @@ class OceanDiskStorage(HiCacheStorage):
         on_layer_ready=None,
         timings=None,
         perf_context=None,
-    ) -> None:
-        """Submit layer zero and the remaining layers separately, then publish readiness."""
+        defer_remaining=False,
+    ):
+        """Submit layer zero now; optionally return a worker continuation for the rest."""
         import od_utils
 
         started = time.perf_counter()
@@ -679,10 +680,7 @@ class OceanDiskStorage(HiCacheStorage):
                     task, pending_puts = perf_context
                     submit_pending_start = pending_puts()
                 dispatch_started = time.perf_counter()
-                spans = [(0, 1)] if layers else []
-                if len(layers) > 1:
-                    spans.append((1, len(layers)))
-                for first, last in spans:
+                def submit_span(first, last):
                     # Slice both metadata tensors and use local layer indices:
                     # the native wrapper indexes CPU task IDs and GPU rows
                     # differently for a nonzero start layer.
@@ -705,73 +703,90 @@ class OceanDiskStorage(HiCacheStorage):
                             self._get_stream,
                         )
                         native_times.append((time.perf_counter() - step) * 1000)
-                if perf_context is not None:
-                    submit_pending_end = pending_puts()
-                    # KV and Indexer use the same route. Count only the KV half
-                    # of one layer so each page is counted once per task.
-                    conn_pages = Counter()
-                    for batch in descriptors:
-                        row = batch[0]
-                        count = (len(row) - 1) // 6
-                        conn_pages.update(
-                            map(int, row[1 + 5 * count : 1 + 5 * count + count // 2])
-                        )
-                    logger.info(
-                        "[OceanDisk PERF GET SUBMIT] task=%s layers=%d calls=%d "
-                        "mode=first_layer_then_remaining "
-                        "native_call_ms=%.3f prepare_ms=%.3f "
-                        "pending_put_start=%d pending_put_end=%d conn_pages=%s "
-                        "pack_ms=%.3f cpu_tensor_ms=%.3f upload_ms=%.3f",
-                        task,
-                        len(layers),
-                        len(native_times),
-                        sum(native_times),
-                        (dispatch_started - started) * 1000,
-                        submit_pending_start,
-                        submit_pending_end,
-                        dict(sorted(conn_pages.items())),
-                        (packed - started) * 1000 - cpu_tensor_ms,
-                        cpu_tensor_ms,
-                        upload_ms,
-                    )
-                for layer in range(len(layers)):
-                    # A layer is usable only after every I/O batch containing
-                    # its paired KV/Indexer fragments has completed.
-                    step = time.perf_counter()
-                    for _, _, events in submitted:
-                        events[layer].synchronize()
-                    layer_wait_ms = (time.perf_counter() - step) * 1000
-                    event_wait_ms += layer_wait_ms
-                    if layer in (0, len(layers) - 1):
-                        trace_event("GET_LAYER_READY", layer=layer)
-                    if on_layer_ready is not None:
-                        on_layer_ready(layer)
-                    if perf_context is not None:
-                        logger.info(
-                            "[OceanDisk PERF GET LAYER] task=%s layer=%d event_wait_ms=%.3f",
-                            task,
-                            layer,
-                            layer_wait_ms,
-                        )
-                    if layer == 0:
-                        first_layer_ms = (time.perf_counter() - started) * 1000
-                if timings is not None:
-                    timings.update(
-                        pack_ms=(packed - started) * 1000 - cpu_tensor_ms,
-                        cpu_tensor_ms=cpu_tensor_ms,
-                        upload_ms=upload_ms,
-                        calls=len(native_times),
-                        native_total_ms=sum(native_times),
-                        native_max_ms=max(native_times, default=0.0),
-                        layer_event_wait_ms=event_wait_ms,
-                        storage_first_layer_ms=first_layer_ms,
-                        storage_total_ms=(time.perf_counter() - started) * 1000,
-                    )
-                trace_event(
-                    "GET_DONE",
-                    layers=len(layers),
-                    meaning="layer_events_finished",
-                )
+
+                def finish():
+                    event_wait_ms = 0.0
+                    first_layer_ms = None
+                    with torch.cuda.device(self.device), torch.cuda.stream(self._get_stream):
+                        try:
+                            if len(layers) > 1:
+                                submit_span(1, len(layers))
+                            if perf_context is not None:
+                                submit_pending_end = pending_puts()
+                                # KV and Indexer use the same route. Count only the KV half
+                                # of one layer so each page is counted once per task.
+                                conn_pages = Counter()
+                                for batch in descriptors:
+                                    row = batch[0]
+                                    count = (len(row) - 1) // 6
+                                    conn_pages.update(
+                                        map(int, row[1 + 5 * count : 1 + 5 * count + count // 2])
+                                    )
+                                logger.info(
+                                    "[OceanDisk PERF GET SUBMIT] task=%s layers=%d calls=%d "
+                                    "mode=first_layer_then_remaining "
+                                    "native_call_ms=%.3f prepare_ms=%.3f "
+                                    "pending_put_start=%d pending_put_end=%d conn_pages=%s "
+                                    "pack_ms=%.3f cpu_tensor_ms=%.3f upload_ms=%.3f",
+                                    task,
+                                    len(layers),
+                                    len(native_times),
+                                    sum(native_times),
+                                    (dispatch_started - started) * 1000,
+                                    submit_pending_start,
+                                    submit_pending_end,
+                                    dict(sorted(conn_pages.items())),
+                                    (packed - started) * 1000 - cpu_tensor_ms,
+                                    cpu_tensor_ms,
+                                    upload_ms,
+                                )
+                            for layer in range(len(layers)):
+                                # A layer is usable only after every I/O batch containing
+                                # its paired KV/Indexer fragments has completed.
+                                step = time.perf_counter()
+                                for _, _, events in submitted:
+                                    events[layer].synchronize()
+                                layer_wait_ms = (time.perf_counter() - step) * 1000
+                                event_wait_ms += layer_wait_ms
+                                if layer in (0, len(layers) - 1):
+                                    trace_event("GET_LAYER_READY", layer=layer)
+                                if on_layer_ready is not None:
+                                    on_layer_ready(layer)
+                                if perf_context is not None:
+                                    logger.info(
+                                        "[OceanDisk PERF GET LAYER] task=%s layer=%d event_wait_ms=%.3f",
+                                        task,
+                                        layer,
+                                        layer_wait_ms,
+                                    )
+                                if layer == 0:
+                                    first_layer_ms = (time.perf_counter() - started) * 1000
+                            if timings is not None:
+                                timings.update(
+                                    pack_ms=(packed - started) * 1000 - cpu_tensor_ms,
+                                    cpu_tensor_ms=cpu_tensor_ms,
+                                    upload_ms=upload_ms,
+                                    calls=len(native_times),
+                                    native_total_ms=sum(native_times),
+                                    native_max_ms=max(native_times, default=0.0),
+                                    layer_event_wait_ms=event_wait_ms,
+                                    storage_first_layer_ms=first_layer_ms,
+                                    storage_total_ms=(time.perf_counter() - started) * 1000,
+                                )
+                            trace_event(
+                                "GET_DONE",
+                                layers=len(layers),
+                                meaning="layer_events_finished",
+                            )
+                        except BaseException:
+                            self._get_stream.synchronize()
+                            raise
+
+                if layers:
+                    submit_span(0, 1)
+                if defer_remaining:
+                    return finish
+                finish()
             except BaseException:
                 self._get_stream.synchronize()
                 raise
