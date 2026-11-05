@@ -385,7 +385,7 @@ class OceanDiskStorage(HiCacheStorage):
         individual key statuses. Entries after the first miss remain False.
         """
         torch = self._torch
-        # Native EXISTS parses metadata on CPU; keep it there to avoid a GPU roundtrip.
+        # Metadata uses the querying thread's current stream.
         with torch.cuda.device(self.device):
             self._ensure_open()
             if timings is not None:
@@ -417,7 +417,7 @@ class OceanDiskStorage(HiCacheStorage):
             metadata = torch.tensor(
                 [next(self._task_ids), *keys, *connections],
                 dtype=torch.int64,
-                device="cpu",
+                device=self.device,
             )
             if timings is not None:
                 metadata_done = time.perf_counter()
@@ -445,7 +445,7 @@ class OceanDiskStorage(HiCacheStorage):
                 probe = torch.tensor(
                     [next(self._task_ids), key, conn],
                     dtype=torch.int64,
-                    device="cpu",
+                    device=self.device,
                 )
                 single_hit = self._ops.kvcache_exist(probe, self._output)
             except Exception as error:
