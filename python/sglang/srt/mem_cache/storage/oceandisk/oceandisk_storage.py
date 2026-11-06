@@ -30,6 +30,20 @@ GET_METADATA_WIDTH = 40960  # od/cache_controller.py: max_block_pram_length
 logger = logging.getLogger(__name__)
 
 
+def get_timeline(stage, task, **details):
+    """CPU observation points only; never synchronize CUDA for logging."""
+    if os.environ.get("SGLANG_OCEANDISK_GET_TIMELINE") != "1":
+        return
+    wall_ns = time.time_ns()
+    mono_ns = time.perf_counter_ns()
+    logger.info(
+        "[OceanDisk GET TIMELINE] wall_ns=%d mono_ns=%d pid=%d thread=%s "
+        "task=%s stage=%s details=%s",
+        wall_ns, mono_ns, os.getpid(), threading.current_thread().name,
+        task, stage, details,
+    )
+
+
 def trace_event(event, **details):
     if os.environ.get("SGLANG_OCEANDISK_TRACE") == "1":
         logger.info(
@@ -218,6 +232,7 @@ class OceanDiskStorage(HiCacheStorage):
         self._task_ids = itertools.count(1)
         self._get_metadata_cpu = None
         self._get_metadata_gpu = None
+        self._get_layer_events = None
 
         import torch
 
@@ -596,6 +611,15 @@ class OceanDiskStorage(HiCacheStorage):
         self._get_metadata_gpu = self._torch.empty(
             capacity, dtype=self._torch.int64, device=self.device
         )
+        # One fixed event per layer, just like the legacy controller. The
+        # scheduler does not overlap GET batches; the worker confirms all
+        # events before the next batch reuses metadata and records them again.
+        with self._torch.cuda.device(self.device):
+            self._get_layer_events = [
+                self._torch.cuda.Event() for _ in range(num_layers)
+            ]
+            for event in self._get_layer_events:
+                event.record(self._get_stream)
         logger.info(
             "[OceanDisk GET metadata] device=%s rows=%d row_capacity=%d max_pages=%d "
             "cpu_pinned_bytes=%d gpu_bytes=%d allocation=startup",
@@ -629,11 +653,13 @@ class OceanDiskStorage(HiCacheStorage):
         timings=None,
         perf_context=None,
         defer_remaining=False,
+        timeline_task=None,
     ):
         """Submit layer zero now; optionally return a worker continuation for the rest."""
         import od_utils
 
         started = time.perf_counter()
+        get_timeline("METADATA_BEGIN", timeline_task, device=str(self.device))
         native_times = []
         event_wait_ms = 0.0
         first_layer_ms = None
@@ -651,6 +677,7 @@ class OceanDiskStorage(HiCacheStorage):
                 output = cpu.numpy()
                 cpu_tensor_ms = (time.perf_counter() - step) * 1000
             descriptors = self._pack_layer_batches(layers, output=output)
+            get_timeline("METADATA_PACKED", timeline_task, layers=len(layers))
             packed = time.perf_counter()
             upload_ms = 0.0
             submitted = []
@@ -664,8 +691,9 @@ class OceanDiskStorage(HiCacheStorage):
                 for batch_index, batch in enumerate(descriptors):
                     step = time.perf_counter()
                     gpu.copy_(cpu, non_blocking=True)
+                    get_timeline("UPLOAD_ENQUEUED", timeline_task, batch=batch_index)
                     upload_ms += (time.perf_counter() - step) * 1000
-                    events = [torch.cuda.Event() for _ in layers]
+                    events = self._get_layer_events[:len(layers)]
                     for event in events:
                         event.record(self._get_stream)
                     submitted.append((cpu, gpu, events))
@@ -686,6 +714,7 @@ class OceanDiskStorage(HiCacheStorage):
                     # differently for a nonzero start layer.
                     for cpu, gpu, events in submitted:
                         step = time.perf_counter()
+                        get_timeline("NATIVE_GET_ENTER", timeline_task, first=first, last=last)
                         self._run_io(
                             lambda: od_utils.batch_dispatch_get(
                                 gpu[first:last],
@@ -703,6 +732,7 @@ class OceanDiskStorage(HiCacheStorage):
                             self._get_stream,
                         )
                         native_times.append((time.perf_counter() - step) * 1000)
+                        get_timeline("NATIVE_GET_RETURN", timeline_task, first=first, last=last)
 
                 def finish():
                     event_wait_ms = 0.0
@@ -744,8 +774,10 @@ class OceanDiskStorage(HiCacheStorage):
                                 # A layer is usable only after every I/O batch containing
                                 # its paired KV/Indexer fragments has completed.
                                 step = time.perf_counter()
+                                get_timeline("LAYER_EVENT_WAIT_BEGIN", timeline_task, layer=layer)
                                 for _, _, events in submitted:
                                     events[layer].synchronize()
+                                get_timeline("LAYER_EVENT_WAIT_END", timeline_task, layer=layer)
                                 layer_wait_ms = (time.perf_counter() - step) * 1000
                                 event_wait_ms += layer_wait_ms
                                 if layer in (0, len(layers) - 1):

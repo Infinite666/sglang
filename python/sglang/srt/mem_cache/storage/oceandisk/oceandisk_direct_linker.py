@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_storage import (
+    get_timeline,
     OceanDiskRange,
     OceanDiskStorage,
     encode_key,
@@ -139,6 +140,7 @@ class LayerWiseLoadCounter:
 
     def complete(self, index: int, layer: int) -> None:
         self.futures[index][layer].set_result(None)
+        get_timeline("LAYER_FUTURE_COMPLETED", index, layer=layer)
 
     def fail(self, index: int, error: BaseException) -> None:
         for future in self.futures.get(index, ()):
@@ -152,11 +154,13 @@ class LayerWiseLoadCounter:
             return
         perf_trace = os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
         wait_start = time.perf_counter() if perf_trace else 0.0
+        get_timeline("COMPUTE_WAIT_BEGIN", index, layer=threshold)
         try:
             futures[threshold].result()
         except BaseException as error:
             raise RuntimeError("OceanDisk layer-wise KV load failed.") from error
         finally:
+            get_timeline("COMPUTE_WAIT_END", index, layer=threshold)
             if perf_trace:
                 wait_ms = (time.perf_counter() - wait_start) * 1000
                 waits = self._perf_waits.setdefault(index, {})
@@ -557,13 +561,18 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         event = self._ready_event()
         index = self.layer_done_counter.update_producer()
         pending, self.pending_loads = self.pending_loads, {}
+        get_timeline("LOAD_START", index, rids=list(pending))
         try:
+            get_timeline("SOURCE_READY_WAIT_BEGIN", index)
             event.synchronize()
+            get_timeline("SOURCE_READY_WAIT_END", index)
             continuation = None
             if not getattr(self, "_skip_get_for_perf", False):
+                get_timeline("ADDRESS_BEGIN", index)
                 layers = self._transfer_layers(
                     [t for transfers in pending.values() for t in transfers]
                 )
+                get_timeline("ADDRESS_END", index)
                 if layers and layers[0]:
                     continuation = self.storage.get_layers(
                         layers,
@@ -574,6 +583,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                         if os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
                         else None,
                         defer_remaining=True,
+                        timeline_task=index,
                     )
             if continuation is None:
                 for layer in range(self.num_layers):
@@ -582,6 +592,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             self.layer_done_counter.fail(index, error)
             self.completed_loads.put(list(pending))
             raise
+        get_timeline("LOAD_ENQUEUE", index)
         self.load_queue.put((index, pending, continuation))
         trace_event("LOAD_STARTED", counter=index, rids=list(pending))
         return index
@@ -757,6 +768,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                     if task is None:
                         return
                     index, pending, continuation = task
+                    get_timeline("LOAD_DEQUEUE", index)
                     try:
                         if continuation is not None:
                             continuation()
@@ -765,6 +777,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                         self.layer_done_counter.fail(index, error)
                         logger.exception("OceanDisk load batch failed")
                     finally:
+                        get_timeline("LOAD_COMPLETION_ENQUEUE", index)
                         self.completed_loads.put(list(pending))
                 finally:
                     self.load_queue.task_done()
@@ -773,7 +786,9 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         return self.completed_loads.qsize()
 
     def pop_completed_load(self) -> list[str]:
-        return self.completed_loads.get_nowait()
+        rids = self.completed_loads.get_nowait()
+        get_timeline("UC_COMPLETION_POP", None, rids=rids)
+        return rids
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         self._ensure_open()
