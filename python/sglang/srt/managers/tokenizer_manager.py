@@ -2576,6 +2576,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # This is the single write point for first_token_time.
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
+                if (
+                    get_observability().enable_request_time_stats_logging
+                    and isinstance(state.obj, GenerateReqInput)
+                    and self.disaggregation_mode != DisaggregationMode.PREFILL
+                ):
+                    logger.info(
+                        "[Request TTFT] rid=%s ttft_ms=%.3f stream=%s",
+                        recv_obj.rids[i],
+                        state.time_stats.get_first_token_latency() * 1000,
+                        state.obj.stream,
+                    )
 
             if state.finished:
                 span_attrs = (
