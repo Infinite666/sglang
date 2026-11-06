@@ -11,6 +11,7 @@ from concurrent.futures import Future
 from queue import Empty, Queue
 from weakref import WeakValueDictionary
 
+import numpy as np
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
@@ -346,6 +347,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             )
         counts = []
         self._storage_offsets = {}
+        self._get_pool_layouts = {}
         for name, entry in self.pools.items():
             if not entry.packed:
                 raise ValueError("OceanDisk requires packed=True for page objects.")
@@ -359,6 +361,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             self._storage_offsets[name] = offsets
             layer_counts = []
             layer_fragments = []
+            get_layout = []
             for layer in range(self.num_layers):
                 meta = entry.get_prepared_layer_range_meta([0], layer)
                 if meta is None or not meta[1][0]:
@@ -366,6 +369,17 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 fragments = [int(size) for size in meta[1][0]]
                 layer_counts.append(len(fragments))
                 layer_fragments.append(fragments)
+                mapped = entry.layer_mapping[layer]
+                indices = (mapped,) if isinstance(mapped, int) else tuple(mapped)
+                get_layout.append([
+                    (base, stride, size, offsets[component_offsets[index]])
+                    for component, component_offsets in zip(
+                        entry.buffer_meta, entry._component_offsets, strict=True
+                    )
+                    for index in indices
+                    for base, stride, size in (component[index],)
+                ])
+            self._get_pool_layouts[name] = np.asarray(get_layout, dtype=np.int64)
             counts.extend(layer_counts)
             # Raw (pre-padding) bytes for one page of one layer. This is what a
             # round-trip test must be fed; metadata carries the 512-aligned size.
@@ -580,11 +594,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             continuation = None
             if not getattr(self, "_skip_get_for_perf", False):
                 get_timeline("ADDRESS_BEGIN", index)
-                layers = self._transfer_layers(
+                layers = self._get_transfer_layers(
                     [t for transfers in pending.values() for t in transfers]
                 )
                 get_timeline("ADDRESS_END", index)
-                if layers and layers[0]:
+                if layers and len(layers[0]):
                     continuation = self.storage.get_layers(
                         layers,
                         on_layer_submitted=lambda layer, events: self.layer_done_counter.complete(
@@ -607,6 +621,47 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         self.load_queue.put((index, pending, continuation))
         trace_event("LOAD_STARTED", counter=index, rids=list(pending))
         return index
+
+    def _get_transfer_layers(self, transfers):
+        """Build GET key/address/size/offset arrays without per-page objects."""
+        cpu_indices = {}
+        object_keys = {}
+        pools = {PoolName.KV: [], PoolName.INDEXER: []}
+        for transfer in transfers:
+            source = id(transfer.host_indices)
+            if source not in cpu_indices:
+                cpu_indices[source] = transfer.host_indices.detach().to(
+                    device="cpu", dtype=torch.int64
+                )
+            entry = self.pools[transfer.name]
+            locations = np.asarray(
+                entry.prepare_locations(cpu_indices[source]), dtype=np.int64
+            )
+            if len(locations) != len(transfer.keys):
+                raise ValueError("OceanDisk page keys and locations must match.")
+            keys = []
+            for key in transfer.keys:
+                if key not in object_keys:
+                    object_keys[key] = self._object_key(key)
+                keys.append(object_keys[key])
+            # The assembler's mapping, component order and remote offsets are
+            # authoritative, including layers with more than one fragment.
+            layout = self._get_pool_layouts[transfer.name]
+            base, stride, sizes, remote = np.moveaxis(layout, -1, 0)
+            fragments = layout.shape[1]
+            values = np.empty(
+                (self.num_layers, len(keys), fragments, 4), dtype=np.int64
+            )
+            values[..., 0] = np.asarray(keys, dtype=np.int64)[None, :, None]
+            values[..., 1] = base[:, None, :] + locations[None, :, None] * stride[:, None, :]
+            values[..., 2] = sizes[:, None, :]
+            values[..., 3] = remote[:, None, :]
+            pools[transfer.name].append(values.reshape(self.num_layers, -1, 4))
+        ordered = pools[PoolName.KV] + pools[PoolName.INDEXER]
+        if not ordered:
+            return []
+        matrix = np.concatenate(ordered, axis=1)
+        return list(matrix)
 
     def _transfer_layers(
         self, transfers, *, skip_scheduled=False, object_keys=None, timings=None
@@ -742,8 +797,11 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 for layer in range(self.num_layers):
                     self.layer_done_counter.complete(counter_index, layer)
             return
-        layers = self._transfer_layers(transfers)
-        if not write and (not layers or not layers[0]):
+        layers = (
+            self._transfer_layers(transfers) if write
+            else self._get_transfer_layers(transfers)
+        )
+        if not write and (not layers or not len(layers[0])):
             # Nothing to load: release the gates without touching CUDA.
             if counter_index is not None:
                 for layer in range(self.num_layers):

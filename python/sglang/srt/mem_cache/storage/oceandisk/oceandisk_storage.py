@@ -542,6 +542,8 @@ class OceanDiskStorage(HiCacheStorage):
             )
         if count % 2 or any(len(layer) != count for layer in layers):
             raise ValueError("OceanDisk layers require equal, even IO counts.")
+        if isinstance(layers[0], np.ndarray):
+            return [self._pack_get_matrix(layers, output=output)]
         half = count // 2
         # Fix one connection per page for the whole operation, including both
         # KV/Indexer halves and every layer.
@@ -600,6 +602,72 @@ class OceanDiskStorage(HiCacheStorage):
                 np.unique(first_sizes[half:]).tolist(),
             )
         return [batch]
+
+    def _pack_get_matrix(self, layers, *, output=None):
+        """Fill all GET layers using array operations and one page-route pass."""
+        count = len(layers[0])
+        half = count // 2
+        batch = (
+            np.empty((len(layers), 1 + 6 * count), dtype=np.int64)
+            if output is None else output
+        )
+        fields = batch[:, 1:].reshape(len(layers), 6, count)
+        keys = layers[0][:, 0]
+        if not np.array_equal(keys[:half], keys[half:]):
+            raise ValueError("OceanDisk requires matching KV and Indexer halves.")
+        # Fill strided views directly, avoiding a second full input matrix.
+        for layer, values in enumerate(layers):
+            if not np.array_equal(values[:, 0], keys):
+                raise ValueError("OceanDisk GET keys must match across layers.")
+            fields[layer, 2] = values[:, 1]  # Absolute addresses until MR resolution.
+            fields[layer, 4] = values[:, 2]
+            fields[layer, 3] = values[:, 3]
+        batch[:, 0] = np.fromiter(
+            (next(self._task_ids) for _ in layers), dtype=np.int64, count=len(layers)
+        )
+        fields[:, 1] = keys
+        selected = {
+            int(key): self.connection_router.select(int(key)) for key in keys[:half]
+        }
+        connections = np.fromiter(
+            (selected[int(key)] for key in keys[:half]), dtype=np.int64, count=half
+        )
+        fields[:, 5, :half] = connections
+        fields[:, 5, half:] = connections
+        pointers, sizes, remote = fields[:, 2], fields[:, 4], fields[:, 3]
+        if np.any(remote < 0):
+            raise ValueError("OceanDisk storage offsets must be nonnegative.")
+        if self._mr_disjoint:
+            indices = np.searchsorted(self._mr_starts, pointers, side="right") - 1
+            valid = (indices >= 0) & (sizes > 0)
+            valid &= pointers + sizes <= self._mr_ends[indices]
+            if not np.all(valid):
+                layer, item = np.argwhere(~valid)[0]
+                resolve_mr(self.regions, int(pointers[layer, item]), int(sizes[layer, item]))
+            fields[:, 0] = self._mr_ids[indices]
+            pointers -= self._mr_starts[indices]
+        else:
+            # Preserve first-registration semantics for overlapping MR regions.
+            for layer in range(len(layers)):
+                resolved = np.asarray([
+                    resolve_mr(self.regions, int(ptr), int(size))
+                    for ptr, size in zip(pointers[layer], sizes[layer], strict=True)
+                ], dtype=np.int64)
+                fields[layer, 0], pointers[layer] = resolved.T
+        if not getattr(self, "_logged_page_io_sizes", False):
+            self._logged_page_io_sizes = True
+            logger.info(
+                "[OceanDisk page I/O] device=%s layer_row=0 pages=%d "
+                "kv_logical_bytes=%s kv_io_bytes=%s "
+                "index_logical_bytes=%s index_io_bytes=%s",
+                self.device, half,
+                np.unique(sizes[0, :half]).tolist(),
+                np.unique((sizes[0, :half] + 511) & ~511).tolist(),
+                np.unique(sizes[0, half:]).tolist(),
+                np.unique((sizes[0, half:] + 511) & ~511).tolist(),
+            )
+        sizes[:] = (sizes + 511) & ~511
+        return batch
 
     def reserve_get_metadata(self, num_layers):
         # Called during Linker initialization, before starting the load worker.
@@ -672,7 +740,7 @@ class OceanDiskStorage(HiCacheStorage):
             self._ensure_open()
             cpu_tensor_ms = 0.0
             output = None
-            if layers and layers[0] and len(layers[0]) <= MAX_GIDS_RANGES:
+            if layers and len(layers[0]) and len(layers[0]) <= MAX_GIDS_RANGES:
                 step = time.perf_counter()
                 cpu, gpu = self._get_metadata_views(len(layers), len(layers[0]))
                 output = cpu.numpy()
