@@ -569,7 +569,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         ):
             fused_k_indexer_norm_rope_store(
                 key_raw,
-                pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+                self._get_index_k_write_buffer(pool, layer_id),
                 out_cache_loc,
                 self.k_norm.weight,
                 self.k_norm.bias,
@@ -689,6 +689,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if not torch.compiler.is_compiling() and src.data_ptr() == dst.data_ptr():
             return
         dst.copy_(src)
+
+    @staticmethod
+    def _get_index_k_write_buffer(pool, layer_id: int) -> torch.Tensor:
+        getter = getattr(pool, "get_index_k_write_buffer", pool.get_index_k_with_scale_buffer)
+        return getter(layer_id=layer_id)
 
     @staticmethod
     def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
@@ -1403,7 +1408,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            buf = self._get_index_k_write_buffer(pool, layer_id)
             fused_store_index_k_cache(
                 key,
                 buf,
@@ -1419,7 +1424,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # because page_size is 1 there.
         if _use_aiter:
             page_size = pool.page_size
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            buf = self._get_index_k_write_buffer(pool, layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
             if not out_loc.is_contiguous():

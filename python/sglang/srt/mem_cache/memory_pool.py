@@ -5051,6 +5051,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_key_cache.get_local_buffer(layer_id)
 
+    def get_index_k_write_buffer(self, layer_id: int) -> torch.Tensor:
+        order_write = getattr(self.layer_transfer_counter, "order_index_write", None)
+        if order_write is None:
+            return self.get_index_k_with_scale_buffer(layer_id)
+        local_layer = layer_id - self.start_layer
+        order_write(local_layer)
+        return self.index_key_cache.buffer[local_layer]
+
     def get_index_k_continuous(
         self,
         layer_id: int,

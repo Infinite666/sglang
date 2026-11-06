@@ -147,6 +147,15 @@ class LayerWiseLoadCounter:
             if future is not None and not future.done():
                 future.set_exception(error)
 
+    def order_index_write(self, threshold: int) -> None:
+        futures = self.futures.get(self.consumer_index)
+        if futures is None or futures[threshold] is None:
+            return
+        # GET may write alignment padding into an adjacent slot. Keep this
+        # store ordered, and leave the Future intact for subsequent readers.
+        for event in futures[threshold].result():
+            torch.cuda.current_stream().wait_event(event)
+
     def wait_until(self, threshold: int) -> None:
         index = self.consumer_index
         futures = self.futures.get(index)
