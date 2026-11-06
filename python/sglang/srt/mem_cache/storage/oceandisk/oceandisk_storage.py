@@ -650,6 +650,7 @@ class OceanDiskStorage(HiCacheStorage):
         layers,
         *,
         on_layer_ready=None,
+        on_layer_submitted=None,
         timings=None,
         perf_context=None,
         defer_remaining=False,
@@ -733,6 +734,11 @@ class OceanDiskStorage(HiCacheStorage):
                         )
                         native_times.append((time.perf_counter() - step) * 1000)
                         get_timeline("NATIVE_GET_RETURN", timeline_task, first=first, last=last)
+                    if on_layer_submitted is not None:
+                        for layer in range(first, last):
+                            on_layer_submitted(
+                                layer, tuple(events[layer] for _, _, events in submitted)
+                            )
 
                 def finish():
                     event_wait_ms = 0.0
@@ -770,7 +776,14 @@ class OceanDiskStorage(HiCacheStorage):
                                     cpu_tensor_ms,
                                     upload_ms,
                                 )
-                            for layer in range(len(layers)):
+                            # In direct-wait mode the consumer confirms each layer.
+                            # The worker only needs the stream's final completion.
+                            wait_layers = (
+                                range(len(layers) - 1, len(layers)) if layers
+                                and on_layer_submitted is not None and on_layer_ready is None
+                                else range(len(layers))
+                            )
+                            for layer in wait_layers:
                                 # A layer is usable only after every I/O batch containing
                                 # its paired KV/Indexer fragments has completed.
                                 step = time.perf_counter()

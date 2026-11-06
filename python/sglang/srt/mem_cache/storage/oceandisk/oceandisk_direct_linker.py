@@ -127,7 +127,7 @@ class LayerWiseLoadCounter:
         self.num_layers = num_layers
         self.producer_index = -1
         self.consumer_index = -1
-        self.futures: dict[int, list[Future]] = {}
+        self.futures: dict[int, list[Future | None]] = {}
         self._perf_waits = {}
 
     def update_producer(self) -> int:
@@ -138,25 +138,27 @@ class LayerWiseLoadCounter:
     def set_consumer(self, index: int) -> None:
         self.consumer_index = index
 
-    def complete(self, index: int, layer: int) -> None:
-        self.futures[index][layer].set_result(None)
-        get_timeline("LAYER_FUTURE_COMPLETED", index, layer=layer)
+    def complete(self, index: int, layer: int, events=()) -> None:
+        self.futures[index][layer].set_result(events)
+        get_timeline("LAYER_EVENTS_PUBLISHED", index, layer=layer)
 
     def fail(self, index: int, error: BaseException) -> None:
         for future in self.futures.get(index, ()):
-            if not future.done():
+            if future is not None and not future.done():
                 future.set_exception(error)
 
     def wait_until(self, threshold: int) -> None:
         index = self.consumer_index
         futures = self.futures.get(index)
-        if futures is None:
+        if futures is None or futures[threshold] is None:
             return
         perf_trace = os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
         wait_start = time.perf_counter() if perf_trace else 0.0
         get_timeline("COMPUTE_WAIT_BEGIN", index, layer=threshold)
         try:
-            futures[threshold].result()
+            for event in futures[threshold].result():
+                event.synchronize()
+            futures[threshold] = None  # Subsequent accesses to this layer are ready.
         except BaseException as error:
             raise RuntimeError("OceanDisk layer-wise KV load failed.") from error
         finally:
@@ -576,8 +578,8 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 if layers and layers[0]:
                     continuation = self.storage.get_layers(
                         layers,
-                        on_layer_ready=lambda layer: self.layer_done_counter.complete(
-                            index, layer
+                        on_layer_submitted=lambda layer, events: self.layer_done_counter.complete(
+                            index, layer, events
                         ),
                         perf_context=(index, self.pending_offload_tasks)
                         if os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
