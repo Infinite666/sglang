@@ -377,6 +377,29 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- match: probe the remote store and report host_hit_length ----
 
+    def _lookup_for_match(self, req, transfers, num_pages):
+        # Reuse only positive full-range answers within a
+        # request. Keep rank consensus in match(), even on a local cache hit.
+        enabled = (
+            os.environ.get("SGLANG_OCEANDISK_LOOKUP_CACHE", "1") == "1"
+            and type(self.cache_linker).__module__.endswith("oceandisk_direct_linker")
+        )
+        if not enabled:
+            return self.cache_linker.lookup(req.rid, transfers), False
+        signature = (
+            id(self),
+            num_pages,
+            tuple((transfer.name, tuple(transfer.keys)) for transfer in transfers),
+        )
+        previous = getattr(req, "_od_lookup_cache", None)
+        if previous is not None and previous[0] == signature:
+            return list(previous[1]), True
+        req._od_lookup_cache = None
+        restorable = self.cache_linker.lookup(req.rid, transfers)
+        if num_pages in restorable:
+            req._od_lookup_cache = (signature, tuple(restorable))
+        return restorable, False
+
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
@@ -406,7 +429,9 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
+        restorable, lookup_cached = self._lookup_for_match(
+            req, lookup_transfers, len(tail_hashes)
+        )
         lookup_end = time.perf_counter() if perf_match else 0.0
         hit_pages = self._sync_restorable_prefix(
             restorable,
@@ -439,7 +464,7 @@ class UnifiedCacheLinkerWrapper:
             logger.info(
                 "[OceanDisk PERF MATCH] rid=%s input_tokens=%d hbm_tokens=%d "
                 "query_pages=%d od_tokens=%d lookup_ms=%.3f rank_sync_ms=%.3f "
-                "query_seq=%d source=%s caller=%s",
+                "query_seq=%d source=%s caller=%s lookup_cached=%s",
                 req.rid,
                 len(key),
                 device_hit_len,
@@ -450,6 +475,7 @@ class UnifiedCacheLinkerWrapper:
                 query_seq,
                 source,
                 caller,
+                lookup_cached,
             )
         if hit_pages == 0:
             return result
@@ -522,6 +548,9 @@ class UnifiedCacheLinkerWrapper:
     # ---- init_load_back: remote -> device, then insert ----
 
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
+        # The result cache covers admission retries only, not later forwards.
+        if hasattr(req, "_od_lookup_cache"):
+            req._od_lookup_cache = None
         cache = self.cache
         empty_indices = cache.tree_core.empty_match_result.device_indices
         hit = self.hit_markers.pop(req.rid, None)
