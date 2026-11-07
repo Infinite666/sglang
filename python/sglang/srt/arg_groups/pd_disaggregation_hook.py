@@ -101,10 +101,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 raise ValueError(
                     f"--disaggregation-linker-notify requires {requirement}."
                 )
-        if cfg.disaggregation_mode == "decode":
-            # Two rows per page, plus a pair so the first one can be 512-aligned.
-            pages = envs.SGLANG_DISAGGREGATION_LINKER_GET_PAGES.get()
-            envs.SGLANG_DISAGGREGATION_LINKER_INDEXER_SCRATCH_PAGES.set(2 * pages + 2)
 
     if cfg.disaggregation_mode == "prefill" and cfg.dcp_size > 1:
         logger.warning(

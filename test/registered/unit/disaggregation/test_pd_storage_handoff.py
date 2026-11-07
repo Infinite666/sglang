@@ -428,10 +428,15 @@ class TestPdLinker(unittest.TestCase):
         }
         return linker
 
+    def scratch_params(self, scratch_pages):
+        pool = SimpleNamespace(size=400, index_buf_size=400 + scratch_pages * 4)
+        return SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool)
+        )
+
     def test_scratch_rows_keep_padding_inside_their_own_slot(self):
         linker = self.scratch_linker(rows=21)
-        with envs.SGLANG_DISAGGREGATION_LINKER_INDEXER_SCRATCH_PAGES.override(8):
-            linker._init_indexer_scratch(3)
+        linker._init_indexer_scratch(3, self.scratch_params(8))
         rows, slots = linker._scratch_slots(3)
         self.assertEqual(rows, [14, 16, 18])
         self.assertEqual(slots[:4].tolist(), [56, 57, 58, 59])
@@ -440,29 +445,25 @@ class TestPdLinker(unittest.TestCase):
 
     def test_scratch_row_is_never_an_allocatable_row(self):
         linker = self.scratch_linker(rows=20)
-        with envs.SGLANG_DISAGGREGATION_LINKER_INDEXER_SCRATCH_PAGES.override(8):
-            linker._init_indexer_scratch(3)
+        linker._init_indexer_scratch(3, self.scratch_params(8))
         rows, _ = linker._scratch_slots(3)
         self.assertGreaterEqual(rows[0], 20 - 8)
 
     def test_get_larger_than_scratch_is_refused(self):
         linker = self.scratch_linker()
-        with envs.SGLANG_DISAGGREGATION_LINKER_INDEXER_SCRATCH_PAGES.override(8):
-            linker._init_indexer_scratch(3)
+        linker._init_indexer_scratch(3, self.scratch_params(8))
         with self.assertRaises(ValueError):
             linker._scratch_slots(4)
 
     def test_missing_scratch_rows_fail_at_startup(self):
         linker = self.scratch_linker()
-        with envs.SGLANG_DISAGGREGATION_LINKER_INDEXER_SCRATCH_PAGES.override(0):
-            with self.assertRaisesRegex(ValueError, "scratch"):
-                linker._init_indexer_scratch(3)
+        with self.assertRaisesRegex(ValueError, "scratch"):
+            linker._init_indexer_scratch(3, self.scratch_params(0))
 
     def test_unaligned_kv_page_fails_at_startup(self):
         linker = self.scratch_linker(kv_page_bytes=73730)
-        with envs.SGLANG_DISAGGREGATION_LINKER_INDEXER_SCRATCH_PAGES.override(8):
-            with self.assertRaisesRegex(ValueError, "unaligned"):
-                linker._init_indexer_scratch(3)
+        with self.assertRaisesRegex(ValueError, "unaligned"):
+            linker._init_indexer_scratch(3, self.scratch_params(8))
 
     def test_publish_copies_logical_rows_and_nothing_else(self):
         linker = self.scratch_linker()

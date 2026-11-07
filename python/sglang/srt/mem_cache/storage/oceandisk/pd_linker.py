@@ -62,7 +62,7 @@ class OceanDiskPDLinker(OceanDiskDirectLinker):
                 logger.info("OceanDisk PD: this rank issues prefill EXISTS")
         elif mode == "decode":
             slice_pages = envs.SGLANG_DISAGGREGATION_LINKER_GET_PAGES.get()
-            self._init_indexer_scratch(slice_pages)
+            self._init_indexer_scratch(slice_pages, params)
             self.decode_gate = DecodeLoadGate(
                 envs.SGLANG_DISAGGREGATION_LINKER_GET_DECODE_INTERVAL.get()
             )
@@ -74,7 +74,7 @@ class OceanDiskPDLinker(OceanDiskDirectLinker):
             self._untraced_exists = self.storage.exists_many
             self.storage.exists_many = self._traced_exists
 
-    def _init_indexer_scratch(self, slice_pages: int) -> None:
+    def _init_indexer_scratch(self, slice_pages: int, params) -> None:
         """Give every page of a decode GET its own Indexer read target.
 
         Storage I/O is 512-byte aligned, so an 8448-byte Indexer page is read as
@@ -88,7 +88,9 @@ class OceanDiskPDLinker(OceanDiskDirectLinker):
             for _, _, size in component:
                 if size % 512:
                     raise ValueError(f"OceanDisk KV page of {size} bytes is unaligned.")
-        scratch_pages = envs.SGLANG_DISAGGREGATION_LINKER_INDEXER_SCRATCH_PAGES.get()
+        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        pool = getattr(kvcache, "full_kv_pool", kvcache)
+        scratch_pages = (pool.index_buf_size - pool.size) // self.page_size
         if scratch_pages < 2 * slice_pages + 2:
             raise ValueError(
                 f"Decode needs {2 * slice_pages + 2} Indexer scratch rows, "

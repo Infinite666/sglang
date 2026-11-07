@@ -695,8 +695,6 @@ class Envs:
     SGLANG_DISAGGREGATION_LINKER_GET_PAGES = EnvInt(128)
     # While any DP group decodes, release one GET slice every N decode steps.
     SGLANG_DISAGGREGATION_LINKER_GET_DECODE_INTERVAL = EnvInt(16)
-    # Spare Indexer rows for those GETs. Set by the PD hook on decode, 0 elsewhere.
-    SGLANG_DISAGGREGATION_LINKER_INDEXER_SCRATCH_PAGES = EnvInt(0)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")

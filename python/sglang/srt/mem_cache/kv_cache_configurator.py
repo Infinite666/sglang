@@ -1618,6 +1618,16 @@ class KVCacheConfigurator:
                     self.layer_info.start_layer, self.layer_info.end_layer
                 )
             ]
+        if (
+            get_disagg().disaggregation_linker_notify
+            and get_disagg().disaggregation_mode == "decode"
+        ):
+            # Spare Indexer rows past the allocator's range for OceanDisk GETs:
+            # two per page, plus a pair so the first one can be 512-aligned.
+            scratch_pages = 2 * envs.SGLANG_DISAGGREGATION_LINKER_GET_PAGES.get() + 2
+            pool_kwargs["index_buf_size"] = (
+                max_total_num_tokens + scratch_pages * self.pool_page_size
+            )
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,

@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -16,8 +15,6 @@ class IndexKeyCache:
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
         num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
-        # Past the allocator's range, so only the PD decode loader touches them.
-        num_pages += envs.SGLANG_DISAGGREGATION_LINKER_INDEXER_SCRATCH_PAGES.get()
         with (
             torch.cuda.use_mem_pool(pool.custom_mem_pool)
             if pool.custom_mem_pool
