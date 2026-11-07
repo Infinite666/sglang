@@ -546,6 +546,17 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         if group is None:
             end = self._lookup_local_prefix(rid, kv)
         else:
+            if (
+                group.rank_in_group == 0
+                and os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
+            ):
+                logger.info(
+                    "[OceanDisk PERF LOOKUP WRITER] rid=%s exists_tp_rank=1 "
+                    "pending_offload_at_lookup=%d queued_offload_items_at_lookup=%d",
+                    rid,
+                    self.pending_offload_tasks(),
+                    self.offload_queue.qsize(),
+                )
             end = -1
             error = None
             if group.rank_in_group == 1:
