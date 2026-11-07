@@ -13,6 +13,7 @@ import time
 from collections import Counter, OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -138,6 +139,7 @@ class OceanDiskRange:
     storage_offset: int = 0
 
 
+@lru_cache(maxsize=65536)
 def encode_key(identity: tuple) -> int:
     """Encode an object identity as a positive int64."""
     data = json.dumps(identity, separators=(",", ":"), ensure_ascii=True).encode()

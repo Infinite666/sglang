@@ -2,6 +2,7 @@
 """GIDS DPU hash ring matching od/nds_utils.py."""
 
 from bisect import bisect_left
+from functools import lru_cache, partial
 from pathlib import Path
 from threading import Lock
 
@@ -32,11 +33,14 @@ class ConnectionRouter:
             for vnode in range(50)
         )
         self.coordinates = [coord for coord, _ in self.ring]
+        self._find_ring_index = lru_cache(maxsize=65536)(
+            partial(bisect_left, self.coordinates)
+        )
         self.next_connection = [0] * len(self.ring)
         self.lock = Lock()
 
     def select(self, key):
-        index = bisect_left(self.coordinates, key % (1 << 64)) % len(self.ring)
+        index = self._find_ring_index(key % (1 << 64)) % len(self.ring)
         connections = self.groups[self.ring[index][1]]
         with self.lock:
             connection = connections[self.next_connection[index] % len(connections)]
