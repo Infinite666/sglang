@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 MAX_GIDS_CONNECTIONS = 8  # od/gids_kernel.cu: MAX_CONN_NUM
 MAX_GIDS_RANGES = 409600  # od/gids_kernel.cu: MAX_BLOCK_NUM
 GET_METADATA_WIDTH = 40960  # od/cache_controller.py: max_block_pram_length
+PUT_METADATA_REQUESTS = 100  # Legacy controller: _max_batch_block / layer_num.
+PUT_METADATA_ROW_WIDTH = 640 * 6  # Legacy controller: max_block_for_40k.
 logger = logging.getLogger(__name__)
 
 
@@ -982,43 +984,92 @@ class OceanDiskStorage(HiCacheStorage):
                 self._put_stream.synchronize()
                 raise
 
+    def reserve_layerwise_put_metadata(self, num_layers):
+        """Reserve the legacy controller's PUT capacity on the writer only."""
+        capacity = PUT_METADATA_REQUESTS * num_layers * PUT_METADATA_ROW_WIDTH
+        torch = self._torch
+        self._layerwise_put_cpu = torch.empty(
+            capacity, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        self._layerwise_put_gpu = torch.empty(
+            capacity, dtype=torch.int64, device=self.device
+        )
+        self._layerwise_put_free = [(0, capacity)]
+        self._layerwise_put_leases = {}
+        logger.info(
+            "[OceanDisk PUT metadata] device=%s layers=%d capacity_int64=%d "
+            "cpu_bytes=%d gpu_bytes=%d pinned=True",
+            self.device, num_layers, capacity, capacity * 8, capacity * 8,
+        )
+
+    def _acquire_layerwise_put_metadata(self, required):
+        # Only the offload worker allocates and releases these regions.
+        for index, (offset, size) in enumerate(self._layerwise_put_free):
+            if size >= required:
+                if size == required:
+                    self._layerwise_put_free.pop(index)
+                else:
+                    self._layerwise_put_free[index] = (offset + required, size - required)
+                return offset
+        raise RuntimeError(
+            f"OceanDisk PUT metadata arena exhausted: needs {required} int64 values."
+        )
+
+    def _release_layerwise_put_region(self, offset, size):
+        regions = sorted([*self._layerwise_put_free, (offset, size)])
+        merged = []
+        for start, length in regions:
+            if merged and merged[-1][0] + merged[-1][1] == start:
+                previous, available = merged[-1]
+                merged[-1] = (previous, available + length)
+            else:
+                merged.append((start, length))
+        self._layerwise_put_free = merged
+
+    def release_layerwise_put_metadata(self, prepared):
+        """Called by the worker only after the session's finish event completes."""
+        offset, size = self._layerwise_put_leases.pop(id(prepared))
+        self._release_layerwise_put_region(offset, size)
+
     def prepare_layerwise_put(self, layers, *, timings=None):
         """Prepare descriptors on the PUT stream and retain through completion."""
         torch = self._torch
         with torch.cuda.device(self.device), torch.cuda.stream(self._put_stream):
             self._ensure_open()
-            pack_start = time.perf_counter()
-            batches = self._pack_layer_batches(layers)
-            pack_ms = (time.perf_counter() - pack_start) * 1000
-            cpu_ms = upload_ms = views_ms = 0.0
-            prepared = [[] for _ in layers]
-            for batch in batches:
+            width = 1 + 6 * len(layers[0])
+            required = len(layers) * width
+            offset = self._acquire_layerwise_put_metadata(required)
+            try:
                 step = time.perf_counter()
-                cpu = torch.from_numpy(batch)
-                cpu_ms += (time.perf_counter() - step) * 1000
+                cpu = self._layerwise_put_cpu[offset : offset + required].view(len(layers), width)
+                gpu = self._layerwise_put_gpu[offset : offset + required].view(len(layers), width)
+                cpu_ms = (time.perf_counter() - step) * 1000
                 step = time.perf_counter()
-                gpu = cpu.to(self.device)
-                upload_ms += (time.perf_counter() - step) * 1000
+                self._pack_layer_batches(layers, output=cpu.numpy())
+                pack_ms = (time.perf_counter() - step) * 1000
                 step = time.perf_counter()
-                lengths = torch.tensor([cpu.shape[1]], dtype=torch.int64, device="cpu")
+                gpu.copy_(cpu, non_blocking=True)
+                upload_ms = (time.perf_counter() - step) * 1000
+                step = time.perf_counter()
+                lengths = torch.tensor([width], dtype=torch.int64, device="cpu")
                 indices = torch.tensor([0], dtype=torch.int64, device="cpu")
-                for layer in range(len(batch)):
-                    # Single-row views retain the full allocations through the
-                    # session's completion and keep native layer indices local.
-                    prepared[layer].append(
-                        (
-                            cpu[layer : layer + 1],
-                            gpu[layer : layer + 1],
-                            lengths,
-                            indices,
-                        )
+                prepared = [
+                    [(cpu[layer : layer + 1], gpu[layer : layer + 1], lengths, indices)]
+                    for layer in range(len(layers))
+                ]
+                views_ms = (time.perf_counter() - step) * 1000
+                if timings is not None:
+                    timings.update(
+                        pack=pack_ms, cpu_tensor=cpu_ms, upload=upload_ms, views=views_ms
                     )
-                views_ms += (time.perf_counter() - step) * 1000
-            if timings is not None:
-                timings.update(
-                    pack=pack_ms, cpu_tensor=cpu_ms, upload=upload_ms, views=views_ms
-                )
-            return prepared
+                self._layerwise_put_leases[id(prepared)] = (offset, required)
+                return prepared
+            except BaseException:
+                # An upload may already have been submitted; retain its region
+                # if synchronization itself fails.
+                self._put_stream.synchronize()
+                self._release_layerwise_put_region(offset, required)
+                raise
 
     def submit_put_layer(self, layer, prepared, ready_event):
         import od_utils
@@ -1121,5 +1172,9 @@ class OceanDiskStorage(HiCacheStorage):
             self._put_stream.synchronize()
             self._get_metadata_cpu = None
             self._get_metadata_gpu = None
+            if hasattr(self, "_layerwise_put_cpu"):
+                self._layerwise_put_cpu = None
+                self._layerwise_put_gpu = None
+                self._layerwise_put_leases.clear()
             self._closed = True
         # GIDS exposes no deregistration operation; retain registered buffers.

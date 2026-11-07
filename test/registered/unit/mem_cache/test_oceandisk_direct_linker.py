@@ -59,6 +59,24 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestOceanDiskStorage(CustomTestCase):
+    def test_layerwise_put_regions_do_not_overlap_and_merge_after_release(self):
+        storage = OceanDiskStorage.__new__(OceanDiskStorage)
+        storage._layerwise_put_free = [(0, 100)]
+        storage._layerwise_put_leases = {}
+        first = storage._acquire_layerwise_put_metadata(40)
+        second = storage._acquire_layerwise_put_metadata(50)
+        self.assertEqual((first, second), (0, 40))
+        with self.assertRaisesRegex(RuntimeError, "arena exhausted"):
+            storage._acquire_layerwise_put_metadata(11)
+        first_prepared, second_prepared = [], []
+        storage._layerwise_put_leases[id(first_prepared)] = (first, 40)
+        storage._layerwise_put_leases[id(second_prepared)] = (second, 50)
+        storage.release_layerwise_put_metadata(first_prepared)
+        self.assertEqual(storage._layerwise_put_free, [(0, 40), (90, 10)])
+        storage.release_layerwise_put_metadata(second_prepared)
+        self.assertEqual(storage._layerwise_put_free, [(0, 100)])
+        self.assertEqual(storage._acquire_layerwise_put_metadata(100), 0)
+
     def test_vectorized_metadata_matches_scalar_abi(self):
         for regions in (
             [(10000, 100000), (200000, 100000)],
@@ -1091,7 +1109,8 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         linker.offload_results = Queue()
         linker.device = "cuda:0"
         linker.storage.prepare_layerwise_put.return_value = [["layer0"], ["layer1"]]
-        session = LayerwiseSaveSession(linker, lambda timings: [[], []], [7, 8])
+        linker.storage.submit_put_layer.return_value = []
+        session = LayerwiseSaveSession(linker, [[], []], [7, 8])
         linker.get_layerwise_receipts.return_value = [session.completion]
         return linker, session
 
@@ -1116,7 +1135,15 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         self.assertIsNone(session.prepared)
         session.release_source.assert_not_called()
         self.assertIsNone(session.finish_event)
+        linker.storage.release_layerwise_put_metadata.side_effect = (
+            lambda prepared: linker.storage.record_save_event.return_value.synchronize.assert_called_once()
+        )
         self.run_worker(linker)
+        linker.storage.prepare_layerwise_put.assert_called_once()
+        linker.storage.release_layerwise_put_metadata.assert_called_once_with(
+            linker.storage.prepare_layerwise_put.return_value
+        )
+        self.assertIsNone(session.layers)
         self.assertEqual(linker.storage.submit_put_layer.call_count, 2)
         session.finish_event.synchronize.assert_called_once()
         self.assertTrue(session.completion.result())
@@ -1131,12 +1158,12 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
 
     def test_background_preparation_failure_skips_put_and_reports_failure(self):
         linker, session = self.make_session()
-        session.prepare_layers = Mock(side_effect=RuntimeError("prepare failed"))
+        linker.storage.prepare_layerwise_put.side_effect = RuntimeError("prepare failed")
         session.release_source = Mock()
         with session:
             session.save_layer(0)
             session.save_layer(1)
-        session.prepare_layers.assert_not_called()
+        linker.storage.prepare_layerwise_put.assert_not_called()
         self.run_worker(linker)
         linker.storage.submit_put_layer.assert_not_called()
         self.assertFalse(session.completion.result())
@@ -1199,6 +1226,7 @@ class TestOceanDiskLayerwiseSave(CustomTestCase):
         ):
             self.run_worker(linker)
         self.assertFalse(session.completion.result())
+        linker.storage.release_layerwise_put_metadata.assert_not_called()
         session.finish(False)
         self.assertFalse(
             any(r.done() and r.result() for r in linker._layerwise_receipts.values())

@@ -56,11 +56,10 @@ class LayerwiseSaveSession:
         self.native_call_times = []
         self.prepare_details = {}
         self.hook_cpu_ms = 0.0
-        self.prepared = (
-            linker.storage.prepare_layerwise_put(layers, timings=self.prepare_details)
-            if linker.offload_owner
-            else None
-        )
+        # The offload worker prepares metadata before submitting the first
+        # layer. Keep this session's descriptors alive until then.
+        self.layers = layers
+        self.prepared = None
         for key in keys:
             linker._layerwise_receipts[key] = self.completion
         linker._put_started(id(self), len(keys))
@@ -118,6 +117,7 @@ class LayerwiseSaveSession:
             self.release_source()
             self.release_source = None
         self.prepared = None
+        self.layers = None
         self.ready_events.clear()
 
 
@@ -297,6 +297,8 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 "OceanDisk layerwise_save requires PP=1, no speculative decoding, "
                 "and CP=1 or DSA interleave CP with rank-replicated caches."
             )
+        if storage is None and self.layerwise_save_enabled and self.offload_owner:
+            self.storage.reserve_layerwise_put_metadata(self.num_layers)
         self._load_thread = threading.Thread(
             target=self._load_worker, daemon=True, name=f"oceandisk-load-tp{tp_rank}"
         )
@@ -900,6 +902,9 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                                 wait_start = time.perf_counter()
                                 task.finish_event.synchronize()
                                 wait_ms = (time.perf_counter() - wait_start) * 1000
+                                if task.prepared is not None:
+                                    self.storage.release_layerwise_put_metadata(task.prepared)
+                                    task.prepared = None
                                 calls = task.native_call_times
                                 if os.environ.get("SGLANG_OCEANDISK_TRACE") == "1":
                                     logger.info(
@@ -942,6 +947,22 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                         session, layer, ready_event = task
                         if not session.put_failed:
                             try:
+                                if session.prepared is None:
+                                    prepare_start = time.perf_counter()
+                                    prepare_details = {}
+                                    session.prepared = self.storage.prepare_layerwise_put(
+                                        session.layers, timings=prepare_details
+                                    )
+                                    session.layers = None
+                                    if os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1":
+                                        logger.info(
+                                            "[OceanDisk PERF PUT PREPARE] phase=%s pages=%d "
+                                            "worker_ms=%.3f parts_ms=%s",
+                                            session.phase,
+                                            len(session.keys),
+                                            (time.perf_counter() - prepare_start) * 1000,
+                                            {k: round(v, 3) for k, v in prepare_details.items()},
+                                        )
                                 calls = self.storage.submit_put_layer(
                                     layer, session.prepared[layer], ready_event
                                 )
