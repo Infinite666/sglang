@@ -29,12 +29,14 @@ from sglang.srt.environ import envs
 from sglang.srt.managers import data_parallel_controller
 from sglang.srt.managers.data_parallel_controller import DataParallelController
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.storage.oceandisk.pd_decode_loader import group_span
 from sglang.srt.mem_cache.storage.oceandisk.pd_linker import OceanDiskPDLinker
 from sglang.srt.mem_cache.unified_cache import pd_handoff
 from sglang.srt.mem_cache.unified_cache.pd_handoff import (
     TAIL_KEY_PREFIX,
     DecodeHandoff,
     PrefillHandoff,
+    layer_groups,
     tail_page_key,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
@@ -45,20 +47,27 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+# Prefill's layers of a whole page, and decode's two groups over them.
+WHOLE = (0, 3)
+
+
 class FakeJob:
     def __init__(self, full_pages=8):
         self.full_pages = full_pages
+        self.groups = [(0, 2), (2, 3)]
         self.reports = []
 
-    def on_ready(self, start, end, tail):
-        self.reports.append((start, end, tail))
+    def layer_span(self, first_layer, end_layer):
+        return group_span(self.groups, first_layer, end_layer)
+
+    def on_ready(self, start, end, tail, groups):
+        self.reports.append((start, end, tail, groups))
 
 
 class TestReadyTransport(unittest.TestCase):
     def setUp(self):
         mgr = self.mgr = object.__new__(MooncakeKVManager)
         mgr.linker_notify = True
-        mgr.linker_num_layers = 3
         mgr.linker_senders, mgr.linker_receivers = {}, {}
         mgr._staging_outstanding = defaultdict(int)
         mgr.request_status = {7: KVPoll.Transferring}
@@ -105,63 +114,83 @@ class TestReadyTransport(unittest.TestCase):
         self.sender.linker_begin()
         self.finish_aux()
         self.assertEqual(self.mgr.request_status[7], KVPoll.Transferring)
-        self.sender.notify_linker_ready(0, 8, False)
-        self.assertEqual(self.job.reports, [(0, 8, False)])
+        self.sender.notify_linker_ready(0, 8, False, WHOLE)
+        self.assertEqual(self.job.reports, [(0, 8, False, (0, 2))])
+        self.assertEqual(self.mgr.request_status[7], KVPoll.Success)
+
+    def test_layer_report_reaches_decode_but_not_success(self):
+        self.sender.linker_begin()
+        self.finish_aux()
+        self.sender.report_linker_layers(0, 8, (0, 2))
+        self.assertEqual(self.job.reports, [(0, 8, False, (0, 1))])
+        self.assertEqual(self.mgr.request_status[7], KVPoll.Transferring)
+        self.sender.notify_linker_ready(0, 8, False, (2, 3))
+        self.assertEqual(self.job.reports[-1], (0, 8, False, (1, 2)))
         self.assertEqual(self.mgr.request_status[7], KVPoll.Success)
 
     def test_put_finished_before_aux_still_waits_for_aux(self):
         self.sender.linker_begin()
-        self.sender.notify_linker_ready(0, 8, False)
+        self.sender.notify_linker_ready(0, 8, False, WHOLE)
         self.assertEqual(self.mgr.request_status[7], KVPoll.Transferring)
         self.finish_aux()
         self.assertEqual(self.mgr.request_status[7], KVPoll.Success)
 
     def test_tail_flag_reaches_decode(self):
         self.sender.linker_begin()
-        self.sender.notify_linker_ready(8, 8, True)
-        self.assertEqual(self.job.reports, [(8, 8, True)])
+        self.sender.notify_linker_ready(8, 8, True, WHOLE)
+        self.assertEqual(self.job.reports, [(8, 8, True, (0, 2))])
 
     def test_ready_before_bootstrap_is_kept(self):
         infos = self.mgr.transfer_infos.pop(7)
         self.sender.linker_begin()
-        self.sender.notify_linker_ready(0, 8, False)
+        self.sender.notify_linker_ready(0, 8, False, WHOLE)
         self.assertEqual(self.job.reports, [])
         self.mgr.transfer_infos[7] = infos
         self.sender.flush_linker_ready()
-        self.assertEqual(self.job.reports, [(0, 8, False)])
+        self.assertEqual(self.job.reports, [(0, 8, False, (0, 2))])
 
     def test_dummy_peer_gets_no_ready(self):
         self.peer.is_dummy = True
         self.sender.linker_begin()
-        self.sender.notify_linker_ready(0, 8, False)
+        self.sender.notify_linker_ready(0, 8, False, WHOLE)
         self.assertEqual(self.messages, [])
 
     def test_send_exception_becomes_native_failure(self):
         self.sender.fail_linker = Mock()
         self.mgr._send_multipart_locked.side_effect = OSError("gone")
         self.sender.linker_begin()
-        self.sender.notify_linker_ready(0, 8, False)
+        self.sender.notify_linker_ready(0, 8, False, WHOLE)
         self.sender.fail_linker.assert_called_once()
 
     def test_old_sender_cannot_publish_into_reused_room(self):
         self.mgr.linker_senders[7] = object()
         self.sender.linker_begin()
-        self.sender.notify_linker_ready(0, 8, False)
+        self.sender.notify_linker_ready(0, 8, False, WHOLE)
         self.assertEqual(self.messages, [])
 
     def test_out_of_range_ready_fails_the_room(self):
         self.mgr.record_failure = Mock()
         self.mgr.update_status = Mock()
         self.receiver.receive_linker_ready(
-            [b"LINKER_READY", b"7", b"decode", b"0", b"9", b"0"]
+            [b"LINKER_READY", b"7", b"decode", b"0", b"9", b"0", b"0", b"3"]
         )
         self.mgr.update_status.assert_called_once_with(7, KVPoll.Failed)
+        self.assertEqual(self.job.reports, [])
+
+    def test_layers_outside_the_decode_groups_fail_the_room(self):
+        self.mgr.record_failure = Mock()
+        self.mgr.update_status = Mock()
+        self.receiver.receive_linker_ready(
+            [b"LINKER_READY", b"7", b"decode", b"0", b"8", b"0", b"0", b"1"]
+        )
+        self.mgr.update_status.assert_called_once_with(7, KVPoll.Failed)
+        self.assertIn("NOTIFY_LAYERS", self.mgr.record_failure.call_args.args[1])
         self.assertEqual(self.job.reports, [])
 
     def test_wrong_session_is_rejected(self):
         with self.assertRaises(ValueError):
             self.receiver.receive_linker_ready(
-                [b"LINKER_READY", b"7", b"other", b"0", b"8", b"0"]
+                [b"LINKER_READY", b"7", b"other", b"0", b"8", b"0", b"0", b"3"]
             )
 
     def test_metadata_marker(self):
@@ -178,11 +207,26 @@ class TestReadyTransport(unittest.TestCase):
             b"",
         ]
         self.assertFalse(TransferInfo.from_zmq(base).linker_notify)
-        info = TransferInfo.from_zmq([*base, b"LINKER_NOTIFY"])
+        self.assertIsNone(TransferInfo.from_zmq(base).linker_layers)
+        info = TransferInfo.from_zmq([*base, b"LINKER_NOTIFY", b"50"])
         self.assertTrue(info.linker_notify)
+        self.assertEqual(info.linker_layers, 50)
         self.assertFalse(info.is_dummy)
         self.assertEqual(len(info.dst_kv_indices), 0)
         self.assertEqual(info.dst_state_indices, [])
+
+    def test_decode_must_cut_the_same_layer_groups(self):
+        self.mgr.linker_layers = 50
+        info = SimpleNamespace(is_dummy=False, linker_notify=True, linker_layers=50)
+        self.assertIsNone(self.mgr._linker_mismatch(info))
+        info.linker_layers = 25
+        self.assertIn("NOTIFY_LAYERS", self.mgr._linker_mismatch(info))
+        info.linker_layers = None  # A decode that sends no group size.
+        self.assertIn("NOTIFY_LAYERS", self.mgr._linker_mismatch(info))
+        info.linker_notify = False
+        self.assertIn("notification", self.mgr._linker_mismatch(info))
+        info.is_dummy = True
+        self.assertIsNone(self.mgr._linker_mismatch(info))
 
     def test_aux_goes_over_tcp(self):
         self.mgr.enable_custom_mem_pool = False
@@ -215,11 +259,9 @@ class TestReadyTransport(unittest.TestCase):
                 is_mla_backend=True,
             )
 
-    def test_manager_counts_layers_only_with_notifications(self):
+    def test_manager_accepts_dsa_state(self):
         self.initialize(notify=True, state_types=[StateType.DSA])
-        self.assertEqual(self.mgr.linker_num_layers, 78)
         self.initialize(notify=False, state_types=[StateType.DSA_TAIL])
-        self.assertEqual(self.mgr.linker_num_layers, 0)
 
     def test_state_outside_oceandisk_is_refused(self):
         with self.assertRaisesRegex(ValueError, "unsupported transfer state"):
@@ -248,7 +290,9 @@ class TestTailPage(unittest.TestCase):
             disagg_kv_sender=self.sender,
             kv=SimpleNamespace(req_pool_idx=0),
         )
-        self.backend = SimpleNamespace(offload_owner=True)
+        self.backend = SimpleNamespace(
+            offload_owner=True, handoff_layer_groups=[WHOLE], num_layers=3
+        )
         self.wrapper = SimpleNamespace(
             cache=SimpleNamespace(
                 page_size=4,
@@ -318,7 +362,7 @@ class TestTailPage(unittest.TestCase):
         self.sender.notify_linker_ready.assert_not_called()
         receipt.set_result(True)
         self.sender.notify_linker_ready.assert_called_once_with(
-            0, 2, False, receipt=id(receipt)
+            0, 2, False, WHOLE, receipt=id(receipt)
         )
 
     def test_tail_report_names_the_page_boundary(self):
@@ -326,7 +370,7 @@ class TestTailPage(unittest.TestCase):
         self.bind([receipt], keys=(f"{TAIL_KEY_PREFIX}x",))
         receipt.set_result(True)
         self.sender.notify_linker_ready.assert_called_once_with(
-            2, 2, True, receipt=id(receipt)
+            2, 2, True, WHOLE, receipt=id(receipt)
         )
 
     def test_range_waits_for_every_session_writing_it(self):
@@ -354,6 +398,61 @@ class TestTailPage(unittest.TestCase):
             [PoolTransfer(PoolName.KV, keys=["p0"])], [(self.req, 4)], None
         )
         self.sender.linker_begin.assert_not_called()
+
+    def bind_groups(self, keys=("p0", "p1"), other=None):
+        receipt = Future()
+        session = SimpleNamespace(completion=receipt, on_layer_put=None)
+        self.backend.handoff_layer_groups = [(0, 2), (2, 3)]
+        self.backend.sync_puts = Mock()
+        self.backend.get_layerwise_receipts = Mock(
+            return_value=[receipt] if other is None else [receipt, other]
+        )
+        self.sender.report_linker_layers = Mock()
+        transfer = PoolTransfer(PoolName.KV, keys=list(keys))
+        self.handoff.bind_session([transfer], [(self.req, 8)], session)
+        return session, receipt
+
+    def test_session_writing_alone_reports_each_layer_group(self):
+        session, receipt = self.bind_groups()
+        session.on_layer_put(0)
+        self.sender.report_linker_layers.assert_not_called()
+        session.on_layer_put(1)
+        self.backend.sync_puts.assert_called_once()
+        self.sender.report_linker_layers.assert_called_once_with(0, 2, (0, 2))
+        session.on_layer_put(2)
+        self.backend.sync_puts.assert_called_once()
+        receipt.set_result(True)
+        self.sender.notify_linker_ready.assert_called_once_with(
+            0, 2, False, (2, 3), receipt=id(receipt)
+        )
+
+    def test_pages_another_session_writes_wait_for_every_layer(self):
+        other = Future()
+        session, receipt = self.bind_groups(other=other)
+        self.assertIsNone(session.on_layer_put)
+        receipt.set_result(True)
+        other.set_result(True)
+        self.sender.notify_linker_ready.assert_called_once_with(
+            0, 2, False, WHOLE, receipt=id(other)
+        )
+
+    def test_tail_is_reported_once_for_every_layer(self):
+        session, receipt = self.bind_groups(keys=(f"{TAIL_KEY_PREFIX}x",))
+        self.assertIsNone(session.on_layer_put)
+        receipt.set_result(True)
+        self.sender.notify_linker_ready.assert_called_once_with(
+            2, 2, True, WHOLE, receipt=id(receipt)
+        )
+
+
+class TestLayerGroups(unittest.TestCase):
+    def test_groups_cover_every_layer_in_order(self):
+        self.assertEqual(layer_groups(61, 50), [(0, 50), (50, 61)])
+        self.assertEqual(layer_groups(4, 2), [(0, 2), (2, 4)])
+
+    def test_zero_or_whole_model_is_one_report(self):
+        self.assertEqual(layer_groups(61, 0), [(0, 61)])
+        self.assertEqual(layer_groups(61, 61), [(0, 61)])
 
 
 class TestWrapperHooks(unittest.TestCase):
@@ -389,12 +488,17 @@ class TestPdLinker(unittest.TestCase):
         with self.assertRaises(ValueError):
             prefill._shared_namespace(SimpleNamespace(), "prefill")
 
-    def scratch_linker(self, rows=20, kv_page_bytes=73728):
+    def scratch_linker(self, rows=20, kv_page_bytes=73728, layers=1):
         linker = object.__new__(OceanDiskPDLinker)
         linker.device = "cpu"
         linker.page_size = 4
-        self.buffer = torch.zeros(rows, 16, dtype=torch.uint8)
-        linker._indexer = SimpleNamespace(get_hybrid_pool_buffer=lambda: [self.buffer])
+        self.buffers = [torch.zeros(rows, 16, dtype=torch.uint8) for _ in range(layers)]
+        self.buffer = self.buffers[0]
+        linker._indexer = SimpleNamespace(
+            get_hybrid_pool_buffer=lambda: list(self.buffers),
+            components=[list(self.buffers)],
+            layer_mapping={layer: layer for layer in range(layers)},
+        )
         linker.pools = {
             PoolName.KV: SimpleNamespace(buffer_meta=[[(0, 0, kv_page_bytes)]])
         }
@@ -445,11 +549,21 @@ class TestPdLinker(unittest.TestCase):
         self.buffer[15] = 99
         self.buffer[16] = 2
         self.buffer[17] = 99
-        linker._publish_indexer(linker._indexer_publish_plan([3, 4], [14, 16]))
+        linker._publish_indexer(
+            linker._indexer_publish_plan([3, 4], [14, 16], (0, 1))
+        )
         self.assertEqual(self.buffer[3].unique().tolist(), [1])
         self.assertEqual(self.buffer[4].unique().tolist(), [2])
         self.assertEqual(self.buffer[5].unique().tolist(), [7])
         self.assertEqual(self.buffer[2].unique().tolist(), [7])
+
+    def test_publish_touches_only_the_layers_read(self):
+        linker = self.scratch_linker(layers=2)
+        for buffer in self.buffers:
+            buffer[14] = 1
+        linker._publish_indexer(linker._indexer_publish_plan([3], [14], (1, 2)))
+        self.assertEqual(self.buffers[0][3].unique().tolist(), [0])
+        self.assertEqual(self.buffers[1][3].unique().tolist(), [1])
 
 
 class TestLoadGatedPoll(unittest.TestCase):

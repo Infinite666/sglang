@@ -98,6 +98,8 @@ class TransferInfo:
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
     linker_notify: bool = False
+    # Decode's SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS under notifications.
+    linker_layers: Optional[int] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -132,6 +134,11 @@ class TransferInfo:
                 else None
             ),
             linker_notify=len(msg) > 10 and msg[10] == b"LINKER_NOTIFY",
+            linker_layers=(
+                int(msg[11].decode("ascii"))
+                if len(msg) > 11 and msg[10] == b"LINKER_NOTIFY"
+                else None
+            ),
         )
 
 
@@ -221,11 +228,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.linker_notify = getattr(server_args, "disaggregation_linker_notify", False)
-        # Trace label only: READY covers every layer of a page range.
-        self.linker_num_layers = (
-            (len(set(args.kv_layer_ids)) or len(args.kv_data_ptrs))
+        # Prefill and decode must cut READY into the same layer groups.
+        self.linker_layers = (
+            envs.SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS.get()
             if self.linker_notify
-            else 0
+            else None
         )
         # Values are the existing sender/receiver objects, scoped to active rooms.
         self.linker_senders = {}
@@ -2214,6 +2221,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             failure_reason=failure_reason,
         )
 
+    def _linker_mismatch(self, info: TransferInfo) -> Optional[str]:
+        """Why a decode peer cannot take this prefill's Linker READY, if so."""
+        if info.is_dummy:
+            return None
+        if self.linker_notify != info.linker_notify:
+            return "P/D Linker notification configuration mismatch"
+        if self.linker_notify and info.linker_layers != self.linker_layers:
+            return (
+                "P/D Linker READY layer groups differ: prefill reports every "
+                f"{self.linker_layers} layers, decode expects {info.linker_layers}; "
+                "set the same SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS on both"
+            )
+        return None
+
     def start_prefill_thread(self):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
@@ -2338,12 +2359,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         TransferInfo.from_zmq(waiting_req_bytes)
                     )
                     info = self.transfer_infos[room][mooncake_session_id]
-                    if not info.is_dummy and self.linker_notify != info.linker_notify:
+                    mismatch = self._linker_mismatch(info)
+                    if mismatch is not None:
                         self.conclude_failure(
                             bootstrap_room=room,
-                            failure_reason=(
-                                "P/D Linker notification configuration mismatch"
-                            ),
+                            failure_reason=mismatch,
                             targets=[(info.endpoint, info.dst_port)],
                         )
                         continue
@@ -2575,7 +2595,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self.init_time = time.time()
         self._init_trace_ctx()
         self.linker_lock = threading.RLock()
-        self.linker_ready = []  # (start, end, tail) not yet sent to decode.
+        self.linker_ready = []  # (start, end, tail, layers) not yet sent.
         self.linker_pending = 0  # Page ranges with a running PUT.
         self.linker_aux_done = False
         self.linker_concluded = False
@@ -2586,22 +2606,31 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         with self.linker_lock:
             self.linker_pending += 1
 
-    def notify_linker_ready(self, start, end, tail, receipt=None):
+    def notify_linker_ready(self, start, end, tail, layers, receipt=None):
+        """The last report of a page range: every session writing it finished."""
         with self.linker_lock:
             self.linker_pending -= 1
-            if self.kv_mgr.linker_senders.get(self.bootstrap_room) is not self:
-                return
-            self.linker_ready.append((start, end, tail))
-            if ucl_trace.ON:
-                ucl_trace.emit(
-                    "notify.ready",
-                    room=self.bootstrap_room,
-                    pages=[start, end],
-                    layers=[0, self.kv_mgr.linker_num_layers],
-                    origin="receipt",
-                    receipt=receipt,
-                )
-            self.flush_linker_ready()
+            self._report_linker(start, end, tail, layers, "receipt", receipt)
+
+    def report_linker_layers(self, start, end, layers):
+        """An earlier report: the PUT of these layers of [start, end) landed."""
+        with self.linker_lock:
+            self._report_linker(start, end, False, layers, "group", None)
+
+    def _report_linker(self, start, end, tail, layers, origin, receipt):
+        if self.kv_mgr.linker_senders.get(self.bootstrap_room) is not self:
+            return
+        self.linker_ready.append((start, end, tail, tuple(layers)))
+        if ucl_trace.ON:
+            ucl_trace.emit(
+                "notify.ready",
+                room=self.bootstrap_room,
+                pages=[start, end],
+                layers=list(layers),
+                origin=origin,
+                receipt=receipt,
+            )
+        self.flush_linker_ready()
 
     def fail_linker(self, reason):
         if ucl_trace.ON:
@@ -2626,10 +2655,10 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
             if not infos or len(infos) < infos[0].required_dst_info_num:
                 return
             try:
-                for start, end, tail in self.linker_ready:
+                for start, end, tail, layers in self.linker_ready:
                     for info in infos:
                         if not info.is_dummy:
-                            self._send_linker_ready(info, start, end, tail)
+                            self._send_linker_ready(info, start, end, tail, layers)
                 self.linker_ready.clear()
                 if (
                     self.linker_aux_done
@@ -2643,7 +2672,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
             except Exception as error:
                 self.fail_linker(f"Linker READY failed: {error}")
 
-    def _send_linker_ready(self, info, start, end, tail):
+    def _send_linker_ready(self, info, start, end, tail, layers):
         room = self.bootstrap_room
         addr = NetworkAddress(info.endpoint, info.dst_port)
         # Before the send: decode may receive before it returns.
@@ -2653,7 +2682,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 room=room,
                 dst=info.mooncake_session_id,
                 pages=[start, end],
-                layers=[0, self.kv_mgr.linker_num_layers],
+                layers=list(layers),
             )
         self.kv_mgr._send_multipart_locked(
             addr.to_tcp(),
@@ -2661,7 +2690,10 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 b"LINKER_READY",
                 str(room).encode(),
                 info.mooncake_session_id.encode(),
-                *[str(value).encode() for value in (start, end, int(tail))],
+                *[
+                    str(value).encode()
+                    for value in (start, end, int(tail), *layers)
+                ],
             ],
             is_ipv6=addr.is_ipv6,
         )
@@ -2765,29 +2797,39 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
     def receive_linker_ready(self, msg):
-        if len(msg) != 6 or msg[2].decode() != self.session_id:
+        if len(msg) != 8 or msg[2].decode() != self.session_id:
             raise ValueError("Invalid Linker READY session")
-        start, end, tail = map(int, msg[3:])
+        start, end, tail, first_layer, end_layer = map(int, msg[3:])
+        layers = [first_layer, end_layer]
         job = self.linker_job
-        if job is None or not 0 <= start <= end <= job.full_pages:
-            self.kv_mgr.record_failure(self.bootstrap_room, "Invalid Linker READY range")
+        groups = None
+        reason = "Invalid Linker READY range"
+        if job is not None and 0 <= start <= end <= job.full_pages:
+            groups = job.layer_span(first_layer, end_layer)
+            reason = (
+                f"Linker READY layers {layers} are not decode layer groups; "
+                "prefill and decode need the same "
+                "SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS"
+            )
+        if groups is None:
+            self.kv_mgr.record_failure(self.bootstrap_room, reason)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             if ucl_trace.ON:
                 ucl_trace.emit(
                     "notify.recv_invalid",
                     room=self.bootstrap_room,
                     pages=[start, end],
-                    layers=[0, self.kv_mgr.linker_num_layers],
+                    layers=layers,
                 )
             return
-        job.on_ready(start, end, bool(tail))
+        job.on_ready(start, end, bool(tail), groups)
         if ucl_trace.ON:
             ucl_trace.emit(
                 "notify.recv",
                 room=self.bootstrap_room,
                 dst=self.session_id,
                 pages=[start, end],
-                layers=[0, self.kv_mgr.linker_num_layers],
+                layers=layers,
             )
 
     def clear(self):
@@ -2893,7 +2935,11 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         linker_job=None,
     ):
-        linker_metadata = [b"LINKER_NOTIFY"] if self.kv_mgr.linker_notify else []
+        linker_metadata = (
+            [b"LINKER_NOTIFY", str(self.kv_mgr.linker_layers).encode("ascii")]
+            if self.kv_mgr.linker_notify
+            else []
+        )
         if linker_job is not None:
             # Before the bootstrap message: READY can follow it immediately.
             self.linker_job = linker_job

@@ -3,7 +3,8 @@
 
 Every page of a prompt reaches decode through OceanDisk. Prefill adds the
 partial last page to its final save session and reports each finished session;
-Mooncake only carries these reports, the first token and the aux data.
+Mooncake only carries these reports, the first token and the aux data. A session
+writing its pages alone also reports each earlier layer group as it lands.
 """
 
 from __future__ import annotations
@@ -47,6 +48,15 @@ def handoff_page_hashes(
     return get_storage_hash_str(key, prior_hash=None, page_size=page_size)
 
 
+def layer_groups(num_layers: int, size: int) -> list[tuple[int, int]]:
+    """Layer ranges prefill reports one at a time; one range when ``size`` is 0."""
+    if size <= 0 or size >= num_layers:
+        return [(0, num_layers)]
+    return [
+        (start, min(start + size, num_layers)) for start in range(0, num_layers, size)
+    ]
+
+
 def tail_page_key(page_hashes: Sequence[str], tail_tokens) -> str:
     """Storage identity of a partial last page.
 
@@ -61,11 +71,14 @@ def tail_page_key(page_hashes: Sequence[str], tail_tokens) -> str:
 class _ReceiptJoin:
     """Report one page range once every session writing it has finished."""
 
-    def __init__(self, sender, start: int, end: int, tail: bool, receipts: list):
+    def __init__(
+        self, sender, start: int, end: int, tail: bool, layers: tuple, receipts: list
+    ):
         self.sender = sender
         self.start = start
         self.end = end
         self.tail = tail
+        self.layers = layers
         self.left = len(receipts)
         self.success = True
         self.lock = threading.Lock()
@@ -87,10 +100,39 @@ class _ReceiptJoin:
             return
         if result:
             self.sender.notify_linker_ready(
-                self.start, self.end, self.tail, receipt=id(receipt)
+                self.start, self.end, self.tail, self.layers, receipt=id(receipt)
             )
         else:
             self.sender.fail_linker("OceanDisk PUT did not complete successfully")
+
+
+class _GroupReports:
+    """Report each layer group but the last as soon as its PUT lands.
+
+    Offload worker thread, after each layer's PUT is submitted. Waiting for a
+    group's PUT holds back the next layer's submit, never the forward.
+    """
+
+    def __init__(self, backend, session_id: int, groups, reports: list):
+        self.backend = backend
+        self.session_id = session_id
+        self.groups = {end: (start, end) for start, end in groups}
+        self.reports = reports  # (sender, first page, end page)
+
+    def __call__(self, layer: int) -> None:
+        layers = self.groups.get(layer + 1)
+        if layers is None:
+            return
+        self.backend.sync_puts()
+        if ucl_trace.ON:
+            ucl_trace.emit(
+                "od.put.group_done",
+                session=self.session_id,
+                layer_start=layers[0],
+                layer_end=layers[1],
+            )
+        for sender, start, end in self.reports:
+            sender.report_linker_layers(start, end, layers)
 
 
 def _trace_session_done(session_id: int, pages: int, receipt) -> None:
@@ -169,6 +211,8 @@ class PrefillHandoff:
                     _trace_session_done(session_id, pages, receipt)
                 )
             )
+        groups = backend.handoff_layer_groups
+        reports = []
         for transfer, (req, length) in zip(transfers, completed, strict=True):
             sender = getattr(req, "disagg_kv_sender", None)
             if not hasattr(sender, "linker_begin"):
@@ -181,7 +225,22 @@ class PrefillHandoff:
             if any(receipt is None for receipt in receipts):
                 sender.fail_linker("OceanDisk save has no completion receipt")
                 continue
-            _ReceiptJoin(sender, start, end, tail, receipts)
+            layers = (0, backend.num_layers)
+            if (
+                len(groups) > 1
+                and not tail
+                and session is not None
+                and all(receipt is session.completion for receipt in receipts)
+            ):
+                # No other session writes these pages, so their earlier groups
+                # are reported as they land and the receipt reports the last.
+                reports.append((sender, start, end))
+                layers = groups[-1]
+            _ReceiptJoin(sender, start, end, tail, layers, receipts)
+        if reports:
+            session.on_layer_put = _GroupReports(
+                backend, id(session), groups[:-1], reports
+            )
 
 
 class DecodeHandoff:

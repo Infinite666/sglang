@@ -95,6 +95,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "GET decode interval > 0": (
                 envs.SGLANG_DISAGGREGATION_LINKER_GET_DECODE_INTERVAL.get() > 0
             ),
+            "READY layer group >= 0": (
+                envs.SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS.get() >= 0
+            ),
         }
         for requirement, satisfied in requirements.items():
             if not satisfied:

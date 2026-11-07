@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.storage.oceandisk.pd_decode_loader import (
 )
 from sglang.srt.mem_cache.unified_cache.pd_handoff import (
     handoff_page_hashes,
+    layer_groups,
     tail_page_key,
 )
 from sglang.srt.observability import ucl_trace
@@ -46,6 +47,10 @@ class OceanDiskPDLinker(OceanDiskDirectLinker):
         self.handoff_loader = None
         self._handoff_batch = 0
         self._indexer = self.pools[PoolName.INDEXER]
+        # Prefill reports, and decode reads, each layer group of a page range.
+        self.handoff_layer_groups = layer_groups(
+            self.num_layers, envs.SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS.get()
+        )
         # Prefill EXISTS is the mixed one: TP1 queries, the other ranks
         # report every page and the caller's MIN yields TP1's result.
         if mode == "prefill":
@@ -60,7 +65,7 @@ class OceanDiskPDLinker(OceanDiskDirectLinker):
                 envs.SGLANG_DISAGGREGATION_LINKER_GET_DECODE_INTERVAL.get()
             )
             self.handoff_loader = DecodeHandoffLoader(
-                self, self.decode_gate, slice_pages
+                self, self.decode_gate, slice_pages, self.handoff_layer_groups
             )
             self.handoff_loader.start()
         if ucl_trace.ON:
@@ -105,17 +110,29 @@ class OceanDiskPDLinker(OceanDiskDirectLinker):
         ) + torch.arange(page, dtype=torch.int64)
         return rows, slots.reshape(-1)
 
-    def _indexer_publish_plan(self, rows, scratch_rows) -> tuple:
-        """Device indices, built ahead so nothing blocks behind a running GET."""
-        return tuple(
+    def _indexer_publish_plan(self, rows, scratch_rows, layer_range) -> tuple:
+        """Built ahead so nothing blocks behind a running GET."""
+        target, source = (
             torch.tensor(values, dtype=torch.int64, device=self.device)
             for values in (rows, scratch_rows)
         )
+        return target, source, self._indexer_buffers(*layer_range)
+
+    def _indexer_buffers(self, first_layer: int, end_layer: int) -> list:
+        """Indexer tensors of layers [first_layer, end_layer), as GET maps them."""
+        buffers = []
+        for layer in range(first_layer, end_layer):
+            mapped = self._indexer.layer_mapping[layer]
+            for index in (mapped,) if isinstance(mapped, int) else mapped:
+                buffers.extend(
+                    component[index] for component in self._indexer.components
+                )
+        return buffers
 
     def _publish_indexer(self, plan) -> None:
         """Copy whole logical rows, which end where the next page starts."""
-        target, source = plan
-        for buffer in self._indexer.get_hybrid_pool_buffer():
+        target, source, buffers = plan
+        for buffer in buffers:
             buffer[target] = buffer[source]
 
     def _shared_namespace(self, server_args, mode):
@@ -177,22 +194,25 @@ class OceanDiskPDLinker(OceanDiskDirectLinker):
             bitmap = self.storage.exists_many(list(object_keys))
         return next((i for i, hit in enumerate(bitmap) if not hit), len(bitmap))
 
-    def handoff_get(self, page_keys, slots, *, tag: str, first_page: int) -> None:
-        """One blocking GET into slots this request already owns."""
+    def handoff_get(
+        self, page_keys, slots, *, tag: str, first_page: int, layer_range
+    ) -> None:
+        """One blocking GET of layers [first, end) into slots the request owns."""
         import od_utils
 
         self._handoff_batch += 1
         batch = self._handoff_batch
-        layer_range = [0, self.num_layers]
+        first_layer, end_layer = layer_range
         if ucl_trace.ON:
             pages = [first_page, first_page + len(page_keys)]
-            ucl_trace.emit("linker.load_submit", tag, pages=pages, layers=layer_range)
+            span = [first_layer, end_layer]
+            ucl_trace.emit("linker.load_submit", tag, pages=pages, layers=span)
             ucl_trace.emit(
                 "od.get.enqueue",
                 batch=batch,
                 tags=[tag],
                 pages=[len(page_keys)],
-                layers=layer_range,
+                layers=span,
             )
             ucl_trace.emit("od.get.dequeue", batch=batch)
             ucl_trace.emit("od.get.dep_ready", batch=batch)
@@ -216,7 +236,7 @@ class OceanDiskPDLinker(OceanDiskDirectLinker):
                 else item
                 for item in expanded
             ]
-        )
+        )[first_layer:end_layer]
         storage = self.storage
         stream = storage._get_stream
         if ucl_trace.ON:
@@ -226,7 +246,9 @@ class OceanDiskPDLinker(OceanDiskDirectLinker):
         ok = False
         with torch.cuda.device(self.device), torch.cuda.stream(stream):
             try:
-                publish_plan = self._indexer_publish_plan(rows, scratch_rows)
+                publish_plan = self._indexer_publish_plan(
+                    rows, scratch_rows, layer_range
+                )
                 cpu, gpu = storage._get_metadata_views(len(layers), len(layers[0]))
                 storage._pack_layer_batches(layers, output=cpu.numpy())
                 gpu.copy_(cpu, non_blocking=True)
@@ -269,6 +291,10 @@ class OceanDiskPDLinker(OceanDiskDirectLinker):
                 if ucl_trace.ON:
                     ucl_trace.emit("od.get.done", batch=batch, ok=ok)
                     ucl_trace.emit("uc.load.consumed", tag, batch=batch, ok=ok)
+
+    def sync_puts(self) -> None:
+        """Offload worker thread: wait for every PUT submitted so far."""
+        self.storage.record_save_event().synchronize()
 
     def handoff_applied(self, tag, *, ok, loaded_pages, page_size) -> None:
         if ucl_trace.ON:

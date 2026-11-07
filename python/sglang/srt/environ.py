@@ -695,6 +695,9 @@ class Envs:
     SGLANG_DISAGGREGATION_LINKER_GET_PAGES = EnvInt(128)
     # While any DP group decodes, release one GET slice every N decode steps.
     SGLANG_DISAGGREGATION_LINKER_GET_DECODE_INTERVAL = EnvInt(16)
+    # Prefill reports every N layers once their PUT lands, so decode reads them
+    # while later layers are written; 0 reports whole pages. Same on P and D.
+    SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS = EnvInt(50)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")

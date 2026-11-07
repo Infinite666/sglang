@@ -80,6 +80,9 @@ def cache_debug(event, **details):
 class LayerwiseSaveSession:
     """One forward's puts, completed by the offload worker and reaped by UC."""
 
+    # PD prefill reports finished layer groups through this; None when mixed.
+    on_layer_put = None
+
     def __init__(self, linker, layers, keys, phase="prefill"):
         self.linker = linker
         self.keys = keys
@@ -1055,6 +1058,8 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                                     layer, session.prepared[layer], ready_event
                                 )
                                 session.native_call_times.extend(calls)
+                                if session.on_layer_put is not None:
+                                    session.on_layer_put(layer)
                             except BaseException:
                                 session.put_failed = True
                                 logger.exception("OceanDisk layer %d PUT failed", layer)
