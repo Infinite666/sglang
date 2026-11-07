@@ -8,6 +8,7 @@ import os
 import threading
 import time
 from concurrent.futures import Future
+from functools import wraps
 from queue import Empty, Queue
 from weakref import WeakValueDictionary
 
@@ -29,6 +30,45 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCache
 from sglang.srt.runtime_context import get_memory, get_model
 
 logger = logging.getLogger(__name__)
+
+
+def _log_linker_latency(operation, elapsed_ms, **fields):
+    logger.info(
+        "[OceanDisk LINKER PERF] op=%s elapsed_ms=%.3f %s",
+        operation,
+        elapsed_ms,
+        " ".join(f"{key}={value}" for key, value in fields.items()),
+    )
+
+
+def _time_linker_call(method):
+    operation = method.__name__
+
+    @wraps(method)
+    def timed(self, *args, **kwargs):
+        if os.environ.get("SGLANG_OCEANDISK_LINKER_PERF") != "1":
+            return method(self, *args, **kwargs)
+        if operation == "start_layer_wise_loading":
+            rids = tuple(self.pending_loads)
+        started = time.perf_counter()
+        result = method(self, *args, **kwargs)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if operation in ("lookup", "load"):
+            fields = {"rid": args[0] if args else kwargs["rid"]}
+        elif operation == "start_layer_wise_loading":
+            if result == -1:
+                return result
+            fields = {"task": result, "rids": ",".join(rids)}
+        else:
+            fields = {
+                "phase": kwargs.get("phase", "prefill"),
+                "task": id(result) if result is not None else None,
+                "pages": len(result.keys) if result is not None else 0,
+            }
+        _log_linker_latency(operation, elapsed_ms, **fields)
+        return result
+
+    return timed
 
 
 def cache_debug(event, **details):
@@ -154,7 +194,8 @@ class LayerWiseLoadCounter:
         if futures is None or futures[threshold] is None:
             return
         perf_trace = os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
-        wait_start = time.perf_counter() if perf_trace else 0.0
+        linker_perf = os.environ.get("SGLANG_OCEANDISK_LINKER_PERF") == "1"
+        wait_start = time.perf_counter() if perf_trace or linker_perf else 0.0
         get_timeline("COMPUTE_WAIT_BEGIN", index, layer=threshold)
         try:
             for event in futures[threshold].result():
@@ -164,17 +205,22 @@ class LayerWiseLoadCounter:
             raise RuntimeError("OceanDisk layer-wise KV load failed.") from error
         finally:
             get_timeline("COMPUTE_WAIT_END", index, layer=threshold)
-            if perf_trace:
+            if perf_trace or linker_perf:
                 wait_ms = (time.perf_counter() - wait_start) * 1000
                 waits = self._perf_waits.setdefault(index, {})
                 if threshold not in waits:
                     waits[threshold] = wait_ms
-                    logger.info(
-                        "[OceanDisk PERF LOAD WAIT] task=%d layer=%d wait_ms=%.3f",
-                        index,
-                        threshold,
-                        wait_ms,
-                    )
+                    if perf_trace:
+                        logger.info(
+                            "[OceanDisk PERF LOAD WAIT] task=%d layer=%d wait_ms=%.3f",
+                            index,
+                            threshold,
+                            wait_ms,
+                        )
+                    if linker_perf:
+                        _log_linker_latency(
+                            "wait_until", wait_ms, task=index, layer=threshold
+                        )
                 if threshold == self.num_layers - 1:
                     self._perf_waits.pop(index, None)
             if threshold == self.num_layers - 1:
@@ -481,6 +527,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             )
             self._put_activity = None
 
+    @_time_linker_call
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         self._ensure_open()
         expanded = self.pool_group.resolve_transfers(transfers)
@@ -546,6 +593,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         )
         return list(range(1, end + 1))
 
+    @_time_linker_call
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         self._ensure_open()
         expanded = self.pool_group.resolve_transfers(
@@ -573,6 +621,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         event.record(torch.cuda.current_stream(self.device))
         return event
 
+    @_time_linker_call
     def start_layer_wise_loading(self) -> int:
         self._ensure_open()
         if not self.pending_loads:
@@ -711,6 +760,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             )
         return layers
 
+    @_time_linker_call
     def begin_layerwise_save(self, transfers, *, phase="prefill"):
         begin_start = time.perf_counter()
         kv_transfers = [t for t in transfers if t.name == PoolName.KV]
