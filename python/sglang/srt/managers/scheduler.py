@@ -291,6 +291,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.observability import ucl_trace
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -438,6 +439,8 @@ class Scheduler(
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
+    # Set on PD decode with linker notifications.
+    linker_decode_gate = None
 
     def __init__(
         self,
@@ -1888,6 +1891,17 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        if ucl_trace.ON and is_cuda():
+            ucl_trace.gpu_streams(
+                "scheduler",
+                forward=self.forward_stream,
+                schedule=self.schedule_stream,
+                copy=getattr(self, "copy_stream", None),
+            )
+        linker = getattr(self.tree_cache, "linker", None)
+        self.linker_decode_gate = getattr(
+            getattr(linker, "cache_linker", None), "decode_gate", None
+        )
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
@@ -3191,6 +3205,14 @@ class Scheduler(
         return True
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if ucl_trace.ON:
+            ucl_trace.emit(
+                "req.arrive",
+                req.rid,
+                room=req.bootstrap_room,
+                input_len=len(req.origin_input_ids),
+                retracted=is_retracted,
+            )
         if not self._set_or_validate_priority(req):
             return
         if is_retracted:
@@ -4314,10 +4336,20 @@ class Scheduler(
                                     self._advance_pending_grammar
                                 )
 
+                        gpu_start = (
+                            ucl_trace.gpu_mark(self.forward_stream)
+                            if ucl_trace.GPU
+                            else None
+                        )
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        if gpu_start is not None:
+                            batch_result.ucl_gpu_marks = (
+                                gpu_start,
+                                ucl_trace.gpu_mark(self.forward_stream),
+                            )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -5834,6 +5866,10 @@ def run_scheduler_process(
         elif get_disagg().disaggregation_mode == "decode":
             thread_label = "Decode Scheduler"
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
+    if ucl_trace.ON:
+        ucl_trace.set_identity(
+            get_disagg().disaggregation_mode, tp_rank=tp_rank, dp_rank=dp_rank
+        )
 
     # Create a scheduler and run the event loop
     scheduler = None

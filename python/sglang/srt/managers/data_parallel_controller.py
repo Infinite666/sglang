@@ -19,6 +19,7 @@ import multiprocessing as mp
 import signal
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from enum import Enum, auto
 
@@ -82,6 +83,10 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 SCHEDULER_PIDS_ARG = "scheduler_pids"
+
+
+_LINKER_AFFINITY_TOKENS = 4096
+_LINKER_AFFINITY_SESSIONS = 65536
 
 
 class LoadBalanceMethod(Enum):
@@ -170,6 +175,15 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
+        # A follow-up round finds its prefix only on the group that served the
+        # last one, so linker notifications keep a session on one DP group.
+        self._linker_affinity = OrderedDict()
+        if (
+            get_disagg().disaggregation_linker_notify
+            and get_disagg().disaggregation_mode == "decode"
+            and self.load_balance_method == LoadBalanceMethod.ROUND_ROBIN
+        ):
+            self.dispatching = self.linker_affinity_scheduler
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
@@ -784,6 +798,29 @@ class DataParallelController:
             f"Cannot route request: all {len(active)} active DP workers "
             "are unavailable."
         )
+
+    def linker_affinity_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        key = getattr(req, "routing_key", None) or hash(
+            tuple((getattr(req, "input_ids", None) or ())[:_LINKER_AFFINITY_TOKENS])
+        )
+        slot = self._linker_affinity.get(key)
+        if slot is not None and slot in self._active_workers and self.status[slot]:
+            self._linker_affinity.move_to_end(key)
+            sock_send(self.workers[slot], req)
+            return
+
+        # New sessions spread evenly; the counter names the chosen worker.
+        active = self._active_workers
+        first = self.round_robin_counter
+        self.round_robin_scheduler(req)
+        attempts = (self.round_robin_counter - first - 1) % len(active)
+        self._linker_affinity[key] = active[(first + attempts) % len(active)]
+        self._linker_affinity.move_to_end(key)
+        while len(self._linker_affinity) > _LINKER_AFFINITY_SESSIONS:
+            self._linker_affinity.popitem(last=False)
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):

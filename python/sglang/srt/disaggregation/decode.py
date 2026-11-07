@@ -45,6 +45,11 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.decode_linker_mixin import (
+    LinkerLoadGatedKVReceiver,
+    apply_linker_polls,
+    new_linker_job,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -95,6 +100,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.observability import ucl_trace
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -321,6 +327,9 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+
+    # OceanDisk loading of this request's pages under linker notifications.
+    linker_job: Optional[Any] = None
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -1229,6 +1238,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
+            # Fake warmup completes locally; a re-bootstrap recomputes output
+            # tokens that prefill does not save, so it stays on native transfer.
+            use_linker_notify = (
+                get_disagg().disaggregation_linker_notify
+                and not _is_fake_transfer(decode_req.req)
+                and not decode_req.is_rebootstrap
+            )
             prefix_match: Optional[DecodePrefixMatch] = None
             use_decode_radix_cache = (
                 get_disagg().disaggregation_decode_enable_radix_cache
@@ -1390,6 +1406,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(preallocated_reqs) + 1,
                 )
             decode_req.req.kv.cache_protected_len = total_prefix_len
+            # Allocate and protect as native Mooncake does, but every page
+            # reaches decode through OceanDisk: Mooncake gets no KV range.
+            if use_linker_notify:
+                total_prefix_len = origin_input_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
@@ -1518,6 +1538,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             state_indices: Optional[List] = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
+            if use_linker_notify:
+                state_indices = None
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -1563,12 +1585,43 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
+            if use_linker_notify:
+                decode_req.linker_job = new_linker_job(
+                    self.tree_cache,
+                    self.req_to_token_pool,
+                    decode_req,
+                    origin_input_len,
+                )
+                metadata_kwargs["linker_job"] = decode_req.linker_job
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
                 **metadata_kwargs,
             )
+            if use_linker_notify:
+                job = decode_req.linker_job
+                job.loader.submit(job)
+            if ucl_trace.ON:
+                ucl_trace.emit(
+                    "pd.prealloc",
+                    decode_req.req.rid,
+                    room=decode_req.req.bootstrap_room,
+                    local_prefix=len(decode_req.req.prefix_indices),
+                    decode_prefix_len=metadata_kwargs["decode_prefix_len"],
+                )
+                if use_linker_notify:
+                    backend = self.tree_cache.linker.cache_linker
+                    ucl_trace.emit(
+                        "linker.plan",
+                        decode_req.req.rid,
+                        room=decode_req.req.bootstrap_room,
+                        prefix_len=job.full_pages * job.page_size,
+                        loaded_len=job.first_page * job.page_size,
+                        page=job.page_size,
+                        window_pages=job.loader.slice_pages,
+                        group=backend.num_layers,
+                    )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
@@ -1856,9 +1909,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and self._radix_full_available() < required_alloc_tokens
         ):
             num_to_evict = required_alloc_tokens - self._radix_full_available()
+            evict_start = ucl_trace.now() if ucl_trace.ON else 0
             result = self.tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=num_to_evict)
             )
+            if ucl_trace.ON:
+                ucl_trace.span(
+                    "pd.evict",
+                    evict_start,
+                    req.rid,
+                    wanted=num_to_evict,
+                    freed=result.num_tokens_evicted,
+                )
             if self._radix_full_available() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
@@ -2302,12 +2364,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if self.scheduler.enable_decode_hicache
             else [dr.kv_receiver for dr in self.queue]
         )
-        return poll_and_all_reduce(
+        linker_notify = get_disagg().disaggregation_linker_notify
+        if linker_notify:
+            pollers = [LinkerLoadGatedKVReceiver(dr) for dr in self.queue]
+        polls = poll_and_all_reduce(
             pollers,
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
         )
+        if linker_notify:
+            return apply_linker_polls(self.queue, polls, self.gloo_group)
+        return polls
 
     def _poll_with_staging(self) -> list:
         return poll_and_all_reduce_with_staging(
@@ -2417,6 +2485,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
+                if ucl_trace.ON:
+                    ucl_trace.emit(
+                        "pd.transferred",
+                        decode_req.req.rid,
+                        room=decode_req.req.bootstrap_room,
+                    )
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                     self.scheduler.output_streamer.stream_output(
@@ -2672,6 +2746,8 @@ class SchedulerDisaggregationDecodeMixin:
             ret = running_batch if not running_batch.is_empty() else None
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
+        if self.linker_decode_gate is not None:
+            self.linker_decode_gate.update(ret)
         if ret:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)

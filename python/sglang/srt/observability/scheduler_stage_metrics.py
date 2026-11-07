@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import TypeVar, cast
 
+from sglang.srt.observability import ucl_trace
 from sglang.srt.utils.nvtx_utils import (
     NVTX_SCHEDULER_ENABLED,
     profile_range,
@@ -158,6 +159,51 @@ def scheduler_stage_method(stage: str) -> Callable[[_F], _F]:
                     recorder._trace_stage = previous_trace_stage
                 recorder.exit(previous_stage)
 
-        return cast(_F, wrapper)
+        if not ucl_trace.ON:
+            return cast(_F, wrapper)
+
+        # Chosen at decoration time: a disabled trace leaves the call path as is.
+        @wraps(func)
+        def traced(self, *args, **kwargs):
+            start = ucl_trace.now()
+            try:
+                return wrapper(self, *args, **kwargs)
+            finally:
+                if ucl_trace.ON:
+                    _ucl_trace_stage(stage, start, args)
+
+        return cast(_F, traced)
 
     return decorator
+
+
+def _ucl_trace_stage(stage: str, start: int, args: tuple) -> None:
+    """Executed batches become spans; other stages are aggregated."""
+    if stage == SCHEDULER_STAGE_PROCESS_BATCH_RESULT and args:
+        # Overlap processes the previous batch here, so name it on slow calls.
+        batch = args[0]
+        ucl_trace.stat(
+            f"sched.{stage}",
+            start,
+            mode=getattr(getattr(batch, "forward_mode", None), "name", None),
+            forward_iter=getattr(batch, "forward_iter", None),
+            rids=[req.rid for req in getattr(batch, "reqs", None) or ()],
+        )
+    elif stage == SCHEDULER_STAGE_RUN_BATCH and args:
+        batch = args[0]
+        mode = getattr(getattr(batch, "forward_mode", None), "name", None)
+        reqs = getattr(batch, "reqs", None) or ()
+        fields = dict(mode=mode, bs=len(reqs))
+        tokens = getattr(batch, "extend_num_tokens", None)
+        if tokens:
+            fields["tokens"] = tokens
+        if mode != "IDLE":
+            # Decode too, so per-request lanes show every step it was in.
+            fields["rids"] = [req.rid for req in reqs]
+        ucl_trace.span("sched.run_batch", start, **fields)
+    else:
+        ucl_trace.stat(
+            f"sched.{stage}",
+            start,
+            slow_ns=None if stage == SCHEDULER_STAGE_IDLE else ucl_trace.SLOW_NS,
+        )

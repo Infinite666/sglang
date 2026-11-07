@@ -22,6 +22,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
+from sglang.srt.observability import ucl_trace
 from sglang.srt.runtime_context import (
     get_disagg,
 )
@@ -1694,6 +1695,8 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
 
     # populate finish metadata and stream output
     req.finished_reason = FINISH_ABORT(error_message, status_code)
+    if ucl_trace.ON:
+        ucl_trace.emit("req.abort", req.rid, reason=str(error_message)[:300])
 
     if req.return_logprob:
         req.logprob.input_token_logprobs_val = []

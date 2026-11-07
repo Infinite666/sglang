@@ -37,6 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.observability import ucl_trace
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -905,13 +906,28 @@ class SchedulerBatchResultProcessor:
         result.grammar_retained_tokens = retained
         result.grammar_advanced = True
 
+    @staticmethod
+    def _wait_copy_done(batch: ScheduleBatch, result: GenerationBatchResult):
+        """The copy stream follows the forward, so this also waits for the
+        forward and everything it depends on, not only the D2H copy."""
+        if not ucl_trace.ON:
+            result.copy_done.synchronize()
+            return
+        start = ucl_trace.now()
+        result.copy_done.synchronize()
+        ucl_trace.stat("sched.copy_done", start, mode=batch.forward_mode.name)
+        if result.ucl_gpu_marks is not None:
+            ucl_trace.gpu_span(
+                "gpu.forward", *result.ucl_gpu_marks, mode=batch.forward_mode.name
+            )
+
     def process_batch_result_idle(
         self,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
-            result.copy_done.synchronize()
+            self._wait_copy_done(batch, result)
 
         self.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
@@ -923,7 +939,7 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
-            result.copy_done.synchronize()
+            self._wait_copy_done(batch, result)
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
@@ -1064,7 +1080,10 @@ class SchedulerBatchResultProcessor:
                 auxiliary_output_starts,
             )
 
+        stream_start = ucl_trace.now() if ucl_trace.ON else 0
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        if ucl_trace.ON:
+            ucl_trace.stat("sched.stream_output", stream_start)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.forward_ct_decode = (
@@ -1339,7 +1358,16 @@ class SchedulerBatchResultProcessor:
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
+                release_start = ucl_trace.now() if ucl_trace.ON else 0
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                if ucl_trace.ON:
+                    ucl_trace.span(
+                        "sched.finish_release",
+                        release_start,
+                        req.rid,
+                        input_tokens=len(req.origin_input_ids),
+                        output_tokens=len(req.output_ids),
+                    )
 
             req.time_stats.set_completion_time()
 

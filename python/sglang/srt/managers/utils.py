@@ -46,6 +46,8 @@ def _async_d2h(t: torch.Tensor) -> torch.Tensor:
 
 @dataclasses.dataclass
 class GenerationBatchResult:
+    # (start, end) marks of this forward; only with SGLANG_UCL_TRACE_GPU.
+    ucl_gpu_marks: Optional[tuple] = None
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
     next_token_ids: Optional[

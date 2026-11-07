@@ -1423,6 +1423,12 @@ class SchedulerDisaggregationPrefillMixin:
             state_indices = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
+            if (
+                get_disagg().disaggregation_linker_notify
+                and req.disagg_decode_prefix_len >= transfer_input_len
+            ):
+                # Decode reads this request's Indexer pages from OceanDisk too.
+                state_indices = None
 
         if self.enable_staging:
             # One sender.send per grid slot; the sender's cumulative page

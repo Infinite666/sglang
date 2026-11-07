@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
+from sglang.srt.observability import ucl_trace
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
@@ -517,6 +518,12 @@ class CommonKVManager(BaseKVManager):
         Runs more than once for a room when a staging chunk is deferred past the
         last one. ``targets`` defaults to the room's non-dummy decode endpoints.
         """
+        if ucl_trace.ON:
+            ucl_trace.emit(
+                "pd.conclude",
+                room=bootstrap_room,
+                status=getattr(status, "name", status),
+            )
         if bootstrap_room not in self.request_status:
             # The sender already cleared this room. Concluding now would
             # re-create it in request_status and leave a failure record that a

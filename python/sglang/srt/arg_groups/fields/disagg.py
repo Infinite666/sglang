@@ -81,6 +81,11 @@ class Disagg(msgspec.Struct):
         bool,
         "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.",
     ] = False
+    disaggregation_linker_notify: A[
+        bool,
+        "Notify decode of completed OceanDisk page/layer groups via Mooncake ZMQ; "
+        "enable on both P and D.",
+    ] = False
     disaggregation_decode_enable_offload_kvcache: A[
         bool, "Enable async KV cache offloading on decode server (PD mode)."
     ] = False

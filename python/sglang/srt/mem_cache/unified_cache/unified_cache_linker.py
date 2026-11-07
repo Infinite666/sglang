@@ -150,6 +150,8 @@ class _PendingOffload(NamedTuple):
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
+    handoff = None  # PD hooks; stays None in mixed deployments.
+
     def __init__(
         self,
         cache: UnifiedRadixCache,
@@ -301,6 +303,8 @@ class UnifiedCacheLinkerWrapper:
                 )
             )
             completed.append((req, last * page_size))
+        if self.handoff is not None:
+            self.handoff.add_tail_pages(batch, transfers, completed)
         if not transfers:
             return None
         plan_done = time.perf_counter()
@@ -341,6 +345,8 @@ class UnifiedCacheLinkerWrapper:
             session.prepare_details["other"] = session.prepare_ms - sum(
                 session.prepare_details.values()
             )
+        if self.handoff is not None:
+            self.handoff.bind_session(transfers, completed, session)
         return session
 
     def get_layerwise_page_hashes(self, req, key: RadixKey) -> list[str] | None:
@@ -378,6 +384,8 @@ class UnifiedCacheLinkerWrapper:
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+        if self.handoff is not None and self.handoff.bypass_match:
+            return result
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
