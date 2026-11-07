@@ -368,34 +368,6 @@ class TestWrapperHooks(unittest.TestCase):
 
 
 class TestPdLinker(unittest.TestCase):
-    def linker(self, *, exists_here):
-        linker = object.__new__(OceanDiskPDLinker)
-        linker._closed = False
-        linker._exists_here = exists_here
-        linker.pool_group = SimpleNamespace(
-            resolve_transfers=lambda transfers: transfers
-        )
-        linker._lookup_local_prefix = Mock(return_value=2)
-        return linker
-
-    def test_querying_rank_reports_the_store(self):
-        linker = self.linker(exists_here=True)
-        transfer = PoolTransfer(PoolName.KV, keys=["a", "b", "c", "d"])
-        self.assertEqual(linker.lookup("rid", [transfer]), [1, 2])
-
-    def test_other_ranks_return_the_full_set(self):
-        linker = self.linker(exists_here=False)
-        transfer = PoolTransfer(PoolName.KV, keys=["a", "b", "c", "d"])
-        self.assertEqual(linker.lookup("rid", [transfer]), [1, 2, 3, 4])
-        linker._lookup_local_prefix.assert_not_called()
-
-    def test_query_failure_is_a_miss_so_peers_are_released(self):
-        linker = self.linker(exists_here=True)
-        linker._lookup_local_prefix.side_effect = RuntimeError("native")
-        transfer = PoolTransfer(PoolName.KV, keys=["a"])
-        with self.assertLogs(level="ERROR"):
-            self.assertEqual(linker.lookup("rid", [transfer]), [])
-
     def namespace(self, tp_size, cp_size):
         return ("tag", "model", 64, tp_size, None, cp_size, 0, 1, 0)
 

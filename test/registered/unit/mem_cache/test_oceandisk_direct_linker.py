@@ -972,6 +972,26 @@ class TestOceanDiskDirectLinker(CustomTestCase):
                 linker.storage.exists_many.return_value = [True, False, False]
                 self.assertEqual(linker.lookup("req", transfers), [1])
 
+    def test_only_tp1_queries_and_the_other_ranks_report_every_page(self):
+        linker = self.make_linker()
+        linker.storage.exists_many.return_value = [True, False, False]
+        transfers = [PoolTransfer(name=PoolName.KV, keys=["p0", "p1", "p2"])]
+        # No cpu_group or ranks: a broadcast would fail here.
+        linker._exists_tp_group = SimpleNamespace(rank_in_group=1)
+        self.assertEqual(linker.lookup("req", transfers), [1])
+        linker.storage.exists_many.reset_mock()
+        linker._exists_tp_group = SimpleNamespace(rank_in_group=0)
+        self.assertEqual(linker.lookup("req", transfers), [1, 2, 3])
+        linker.storage.exists_many.assert_not_called()
+
+    def test_tp1_exists_failure_is_a_miss(self):
+        linker = self.make_linker()
+        linker._exists_tp_group = SimpleNamespace(rank_in_group=1)
+        linker.storage.exists_many.side_effect = RuntimeError("native")
+        transfers = [PoolTransfer(name=PoolName.KV, keys=["p0"])]
+        with self.assertLogs(level="ERROR"):
+            self.assertEqual(linker.lookup("req", transfers), [])
+
     def test_owner_ack_and_duplicate_load(self):
         linker = self.make_linker()
         transfer = PoolTransfer(

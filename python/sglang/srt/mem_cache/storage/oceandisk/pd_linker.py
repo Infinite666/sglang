@@ -13,12 +13,10 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.storage.oceandisk.oceandisk_direct_linker import (
     OceanDiskDirectLinker,
-    _time_linker_call,
 )
 from sglang.srt.mem_cache.storage.oceandisk.pd_decode_loader import (
     DecodeHandoffLoader,
@@ -48,18 +46,13 @@ class OceanDiskPDLinker(OceanDiskDirectLinker):
         self.handoff_loader = None
         self._handoff_batch = 0
         self._indexer = self.pools[PoolName.INDEXER]
-        # P: rank 0 writes and rank 1 queries, so the two never share the PUT
-        # lock. The caller's MIN across ranks yields the querying rank's result.
-        self._exists_here = True
+        # Prefill EXISTS is the mixed one: TP1 queries, the other ranks
+        # report every page and the caller's MIN yields TP1's result.
         if mode == "prefill":
             if not self.layerwise_save_enabled:
                 raise ValueError(
                     "Linker notifications require layerwise_save=true on prefill."
                 )
-            group = get_tp_group()
-            self._exists_here = group.world_size == 1 or group.rank_in_group == 1
-            if self._exists_here:
-                logger.info("OceanDisk PD: this rank issues prefill EXISTS")
         elif mode == "decode":
             slice_pages = envs.SGLANG_DISAGGREGATION_LINKER_GET_PAGES.get()
             self._init_indexer_scratch(slice_pages, params)
@@ -158,23 +151,6 @@ class OceanDiskPDLinker(OceanDiskDirectLinker):
                 upload_ms=parts.get("exists_metadata_ms"),
                 native_ms=parts.get("exists_native_ms"),
             )
-
-    @_time_linker_call
-    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
-        self._ensure_open()
-        expanded = self.pool_group.resolve_transfers(transfers)
-        if not expanded:
-            return []
-        kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
-        if not self._exists_here:
-            return list(range(1, len(kv.keys) + 1))
-        try:
-            end = self._lookup_local_prefix(rid, kv)
-        except Exception:
-            # Peers are already in the MIN reduction; report a miss to release them.
-            logger.exception("OceanDisk EXISTS failed for %s; treating as a miss", rid)
-            end = 0
-        return list(range(1, end + 1))
 
     # ---- decode loader backend ----
 

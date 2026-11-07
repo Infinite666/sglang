@@ -557,18 +557,18 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                     self.pending_offload_tasks(),
                     self.offload_queue.qsize(),
                 )
-            end = -1
-            error = None
             if group.rank_in_group == 1:
                 try:
                     end = self._lookup_local_prefix(rid, kv)
-                except Exception as exc:
-                    error = exc
-            hit = torch.tensor([end], dtype=torch.int64, device="cpu")
-            torch.distributed.broadcast(hit, src=group.ranks[1], group=group.cpu_group)
-            end = int(hit.item())
-            if end < 0:
-                raise RuntimeError(f"OceanDisk EXISTS failed on TP1 for {rid}") from error
+                except Exception:
+                    # Raising would leave the other ranks in the caller's MIN.
+                    logger.exception(
+                        "OceanDisk EXISTS failed on TP1 for %s; treating as a miss", rid
+                    )
+                    end = 0
+            else:
+                # The caller's MIN across ranks yields TP1's result.
+                end = len(kv.keys)
         return list(range(1, end + 1))
 
     def _lookup_local_prefix(self, rid, kv) -> int:
