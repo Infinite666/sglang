@@ -14,7 +14,7 @@ from weakref import WeakValueDictionary
 
 import numpy as np
 import torch
-from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed import get_tensor_model_parallel_rank, get_tp_group
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
@@ -272,6 +272,14 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             and getattr(server_args, "cp_strategy", None) == "interleave"
             and getattr(server_args, "attention_backend", None) == "dsa"
         )
+        self._exists_tp_group = None
+        # Temporary experiment for a shared cache spanning the full model TP group.
+        if shared_cp_cache:
+            model_tp_group = get_tp_group()
+            if params.attn_cp_size == model_tp_group.world_size:
+                self._exists_tp_group = model_tp_group
+                if model_tp_group.rank_in_group == 1:
+                    logger.info("OceanDisk experiment: only TP1 issues EXISTS")
         storage_cp_rank = 0 if shared_cp_cache else params.attn_cp_rank
         rank0_get_only = os.environ.get("SGLANG_OCEANDISK_RANK0_GET_ONLY") == "1"
         self._skip_get_for_perf = False
@@ -534,6 +542,25 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return []
         kv = next(transfer for transfer in expanded if transfer.name == PoolName.KV)
+        group = getattr(self, "_exists_tp_group", None)
+        if group is None:
+            end = self._lookup_local_prefix(rid, kv)
+        else:
+            end = -1
+            error = None
+            if group.rank_in_group == 1:
+                try:
+                    end = self._lookup_local_prefix(rid, kv)
+                except Exception as exc:
+                    error = exc
+            hit = torch.tensor([end], dtype=torch.int64, device="cpu")
+            torch.distributed.broadcast(hit, src=group.ranks[1], group=group.cpu_group)
+            end = int(hit.item())
+            if end < 0:
+                raise RuntimeError(f"OceanDisk EXISTS failed on TP1 for {rid}") from error
+        return list(range(1, end + 1))
+
+    def _lookup_local_prefix(self, rid, kv) -> int:
         keys = [self._object_key(key) for key in kv.keys]
         debug_cache = os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1"
         perf_trace = os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
@@ -591,7 +618,7 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             first_key=keys[0],
             first_miss_key=keys[end] if end < len(keys) else None,
         )
-        return list(range(1, end + 1))
+        return end
 
     @_time_linker_call
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
