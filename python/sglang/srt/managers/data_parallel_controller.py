@@ -177,11 +177,12 @@ class DataParallelController:
         self.dispatching = dispatch_lookup[self.load_balance_method]
         # A follow-up round finds its prefix only on the group that served the
         # last one, so linker notifications keep a session on one DP group.
+        # The configured method places a session's first request.
         self._linker_affinity = OrderedDict()
+        self._linker_new_session = self.dispatching
         if (
             get_disagg().disaggregation_linker_notify
             and get_disagg().disaggregation_mode == "decode"
-            and self.load_balance_method == LoadBalanceMethod.ROUND_ROBIN
         ):
             self.dispatching = self.linker_affinity_scheduler
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
@@ -792,7 +793,7 @@ class DataParallelController:
             if self.status[slot]:
                 logger.debug(f"Choose worker {slot}")
                 sock_send(self.workers[slot], req)
-                return
+                return slot
             attempts += 1
         raise RuntimeError(
             f"Cannot route request: all {len(active)} active DP workers "
@@ -812,12 +813,7 @@ class DataParallelController:
             sock_send(self.workers[slot], req)
             return
 
-        # New sessions spread evenly; the counter names the chosen worker.
-        active = self._active_workers
-        first = self.round_robin_counter
-        self.round_robin_scheduler(req)
-        attempts = (self.round_robin_counter - first - 1) % len(active)
-        self._linker_affinity[key] = active[(first + attempts) % len(active)]
+        self._linker_affinity[key] = self._linker_new_session(req)
         self._linker_affinity.move_to_end(key)
         while len(self._linker_affinity) > _LINKER_AFFINITY_SESSIONS:
             self._linker_affinity.popitem(last=False)
@@ -832,12 +828,14 @@ class DataParallelController:
         )
         target_rank = req.bootstrap_room % len(self.workers)
         sock_send(self.workers[target_rank], req)
+        return target_rank
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
         sock_send(self.workers[target_worker], req)
+        return target_worker
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -847,6 +845,7 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         sock_send(self.workers[target_worker], req)
+        return target_worker
 
     def event_loop(self):
         while True:

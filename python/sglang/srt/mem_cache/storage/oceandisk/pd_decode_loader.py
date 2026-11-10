@@ -30,6 +30,7 @@ _DECODE_START_HOLD_S = 0.03
 _GATED_WAIT_S = 0.0005
 _IDLE_WAIT_S = 0.05
 _HOLE_RECHECK_S = 0.1
+_HOLE_WARN_S = 5.0
 
 
 def merge_ranges(ranges: list, start: int, end: int) -> list:
@@ -148,6 +149,7 @@ class HandoffJob:
         self.closed = False
         self.done = False
         self.next_hole_check = 0.0
+        self.hole_since = None  # When a recheck first found nothing.
         self.sequence = 0
 
     @property
@@ -349,12 +351,29 @@ class DecodeHandoffLoader:
                 return
         with self.condition:
             end = first + hits
+            now = self.clock()
             # A later check targets pages prefill did not write.
             if not job.checked and job.prefill_start is not None:
                 end = min(end, job.prefill_start)
+            elif job.checked and hits == 0:
+                self._report_hole(job, first, last, now)
             job.checked = True
-            job.next_hole_check = self.clock() + _HOLE_RECHECK_S
+            job.next_hole_check = now + _HOLE_RECHECK_S
             job.known_end = max(job.known_end, end)
+
+    def _report_hole(self, job: HandoffJob, first: int, last: int, now: float):
+        """Say once that a request waits on pages nobody provides."""
+        if job.hole_since is None:
+            job.hole_since = now
+        elif job.hole_since >= 0 and now - job.hole_since >= _HOLE_WARN_S:
+            job.hole_since = -1.0
+            logger.warning(
+                "OceanDisk decode load of %s waits on pages [%d, %d): EXISTS "
+                "does not find them and prefill has not reported them",
+                job.rid,
+                first,
+                last,
+            )
 
     def _get(self, job: HandoffJob, first: int, last: int) -> None:
         page = job.page_size

@@ -569,6 +569,7 @@ class TestDecodeAffinity(unittest.TestCase):
         controller.status = [True] * 4
         controller.round_robin_counter = 0
         controller._linker_affinity = data_parallel_controller.OrderedDict()
+        controller._linker_new_session = controller.round_robin_scheduler
         self.sent = self.enterContext(
             patch.object(data_parallel_controller, "sock_send")
         )
@@ -608,6 +609,15 @@ class TestDecodeAffinity(unittest.TestCase):
         self.controller.linker_affinity_scheduler(self.request("a"))
         self.controller.linker_affinity_scheduler(self.request("a"))
         self.assertEqual(self.destinations(), ["w1", "w1"])
+
+    def test_configured_method_places_only_the_first_request(self):
+        placed = iter([2, 0])
+        self.controller._linker_new_session = lambda req: next(placed)
+        for key in ("a", "b", "a", "b"):
+            self.controller.linker_affinity_scheduler(self.request(key))
+        # Later requests of a session are sent here, not by the method.
+        self.assertEqual(self.destinations(), ["w2", "w0"])
+        self.assertEqual(dict(self.controller._linker_affinity), {"a": 2, "b": 0})
 
     def test_explicit_dp_rank_wins(self):
         request = self.request("a")

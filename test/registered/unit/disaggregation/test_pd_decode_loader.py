@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from sglang.srt.mem_cache.storage.oceandisk import pd_decode_loader
 from sglang.srt.mem_cache.storage.oceandisk.pd_decode_loader import (
     DecodeHandoffLoader,
     DecodeLoadGate,
@@ -239,6 +240,18 @@ class TestHandoffJob(LoaderCase):
         self.drive()
         self.assertEqual(self.read_pages()[-1], (3, 2))
         self.assertTrue(job.done)
+
+    def test_pages_nobody_provides_are_reported_once(self):
+        job = self.job(total_len=4 * PAGE)
+        job.on_ready(2, 4, False)
+        self.drive()
+        with self.assertLogs(pd_decode_loader.logger, "WARNING") as logs:
+            for wait in (1, 6, 6):
+                self.clock.now += wait
+                self.drive()
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("pages [0, 2)", logs.output[0])
+        self.assertEqual(job.loaded, 0)
 
     def test_ready_during_a_get_discards_that_get(self):
         self.backend.stored_pages = 4

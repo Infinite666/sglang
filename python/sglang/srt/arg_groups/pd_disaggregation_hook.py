@@ -19,6 +19,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _uses_dsa_attention(server_args: ServerArgs, cfg) -> bool:
+    if cfg.attention_backend is not None:
+        return cfg.attention_backend == "dsa"
+    # Model adjustments run later and give a DSA model the dsa backend.
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    return is_deepseek_dsa(model_config_of(server_args).hf_config)
+
+
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
@@ -59,7 +68,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 cfg.disaggregation_mode != "decode"
                 or cfg.disaggregation_decode_enable_radix_cache
             ),
-            "DSA attention": cfg.attention_backend == "dsa",
+            "DSA attention": _uses_dsa_attention(server_args, cfg),
             "prefill interleave CP": (
                 cfg.disaggregation_mode != "prefill"
                 or (cfg.enable_prefill_cp and cfg.cp_strategy == "interleave")
