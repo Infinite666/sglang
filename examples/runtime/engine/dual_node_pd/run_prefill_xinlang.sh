@@ -40,48 +40,39 @@ export PYTHONPATH=${gids_dir}:$PYTHONPATH
 export OPEXTENSION=${gids_dir}/libop_extension.so
 export USE_SINGLE_PORT=0
 
-# notify
-export SGLANG_DISAGGREGATION_LINKER_NOTIFY_LAYERS=50
-export SGLANG_DISAGGREGATION_LINKER_RDMA_TAIL_TOKENS=8192
+# debug
 export SGLANG_OCEANDISK_TRACE=0
 export SGLANG_OCEANDISK_CACHE_DEBUG=0
 
 python -m sglang.launch_server \
-  --log-level info \
   --model-path ${model_path} \
-  --watchdog-timeout 3600 \
-  --disaggregation-mode prefill \
   --host ${local_ip} \
-  --port 30002 \
+  --port ${port} \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
   --tensor-parallel-size 8 \
   --moe-dense-tp-size 1 \
+  --attn-cp-size 8 \
   --enable-prefill-cp \
   --cp-strategy interleave \
   --mem-fraction-static 0.85 \
+  --moe-a2a-backend none \
   --deepep-mode normal \
+  --disaggregation-mode prefill \
   --disaggregation-transfer-backend mooncake \
   --disaggregation-ib-device ${device_name} \
+  --disaggregation-bootstrap-port ${bootstrap_port} \
   --dist-init-addr ${local_ip}:5000 \
-  --page-size 64 \
   --enable-metrics-for-all-schedulers \
   --enable-metrics \
   --enable-cache-report \
   --trust-remote-code \
+  --log-level info \
+  --watchdog-timeout 3600 \
+  --page-size 64 \
   --chunked-prefill-size 16384 \
   --enable-unified-cache-external-linker \
   --unified-cache-external-linker-backend oceandisk \
   --hicache-storage-backend-extra-config '{"layerwise_save":true}' \
-  --disaggregation-bootstrap-port ${bootstrap_port} \
   --disaggregation-linker-notify \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --kv-cache-dtype fp8_e4m3 \
-  --pipeline-parallel-size 1 \
-  --data-parallel-size 1 \
-  --attn-cp-size 8 \
-  --enable-dsa-cache-layer-split \
-  --dsa-cache-layer-split-mode prefix \
-  --enable-dp-attention \
-  --enable-dp-lm-head \
-  --moe-a2a-backend deepep \
   2>&1 | tee -i ${log_dir}/prefill_$(date +%Y%m%d_%H%M%S).log
