@@ -11,7 +11,6 @@ import os
 import threading
 import time
 from collections import Counter, OrderedDict
-from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -232,7 +231,6 @@ class OceanDiskStorage(HiCacheStorage):
         )
         self._closed = False
         self._debug_put_history = OrderedDict()
-        self._put_io_lock = threading.Lock()
         self._task_ids = itertools.count(1)
         self._get_metadata_cpu = None
         self._get_metadata_gpu = None
@@ -367,11 +365,7 @@ class OceanDiskStorage(HiCacheStorage):
             )
 
     def _run_io(self, operation, stream):
-        # Scheduler layer waits finish GET before the next lookup. Only
-        # background PUT needs exclusion against synchronous EXISTS.
-        io_lock = self._put_io_lock if stream is self._put_stream else nullcontext()
         with (
-            io_lock,
             self._torch.cuda.device(self.device),
             self._torch.cuda.stream(stream),
         ):
@@ -384,29 +378,19 @@ class OceanDiskStorage(HiCacheStorage):
             raise RuntimeError(f"OceanDisk {operation} returned status {status!r}.")
 
     def exists_many(self, keys: list[int], *, timings=None) -> list[bool]:
-        # Exclude new PUT submissions until the synchronous query returns.
         with self._torch.cuda.device(self.device):
+            self._ensure_open()
             started = time.perf_counter() if timings is not None else 0.0
-            with self._put_io_lock:
-                if timings is not None:
-                    timings["put_lock_ms"] = (time.perf_counter() - started) * 1000
-                self._ensure_open()
-                started = time.perf_counter() if timings is not None else 0.0
-                self._put_stream.synchronize()
-                if timings is not None:
-                    timings["put_sync_ms"] = (time.perf_counter() - started) * 1000
-                started = time.perf_counter() if timings is not None else 0.0
-                result = (
-                    self._exists_many(keys, timings=timings)
-                    if timings is not None
-                    else self._exists_many(keys)
-                )
-                if timings is not None:
-                    timings["exists_ms"] = (time.perf_counter() - started) * 1000
-                return result
+            result = (
+                self._exists_many(keys, timings=timings)
+                if timings is not None
+                else self._exists_many(keys)
+            )
+            if timings is not None:
+                timings["exists_ms"] = (time.perf_counter() - started) * 1000
+            return result
 
     def _prepare_exists_metadata(self, keys, connections):
-        # Caller holds _put_io_lock through the synchronous native query.
         count = len(keys)
         width = 1 + 2 * count
         if width > self._exists_metadata_cpu.numel():
@@ -1166,10 +1150,7 @@ class OceanDiskStorage(HiCacheStorage):
         if self._closed:
             return
         # Linker stops and joins its producers before closing Storage.
-        with (
-            self._put_io_lock,
-            self._torch.cuda.device(self.device),
-        ):
+        with self._torch.cuda.device(self.device):
             self._get_stream.synchronize()
             self._put_stream.synchronize()
             self._get_metadata_cpu = None

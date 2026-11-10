@@ -145,8 +145,6 @@ class OceanDiskPDLinker(OceanDiskDirectLinker):
                 "od.exists",
                 start,
                 keys=len(keys),
-                put_lock_ms=parts.get("put_lock_ms"),
-                put_sync_ms=parts.get("put_sync_ms"),
                 route_ms=parts.get("exists_route_ms"),
                 upload_ms=parts.get("exists_metadata_ms"),
                 native_ms=parts.get("exists_native_ms"),

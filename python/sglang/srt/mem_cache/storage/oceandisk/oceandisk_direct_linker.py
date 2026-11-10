@@ -270,7 +270,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
             replicated
             and params.attn_cp_size > 1
             and getattr(server_args, "cp_strategy", None) == "interleave"
-            and getattr(server_args, "attention_backend", None) == "dsa"
         )
         self._exists_tp_group = None
         # Temporary experiment for a shared cache spanning the full model TP group.
@@ -575,8 +574,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
         keys = [self._object_key(key) for key in kv.keys]
         debug_cache = os.environ.get("SGLANG_OCEANDISK_CACHE_DEBUG") == "1"
         perf_trace = os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
-        # Query without draining queued offloads. Storage excludes PUT only
-        # while synchronizing already-submitted work and executing EXISTS.
         pending_at_lookup = self.pending_offload_tasks()
         queued_at_lookup = self.offload_queue.qsize()
         if perf_trace:
@@ -587,10 +584,8 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 "[OceanDisk PERF LOOKUP] rid=%s tp_rank=%d pages=%d "
                 "local_hit_pages=%d local_hit_tokens=%d scope=before_rank_sync "
                 "pending_offload_at_lookup=%d queued_offload_items_at_lookup=%d "
-                "put_lock_ms=%.3f put_sync_ms=%.3f exists_ms=%.3f "
-                "exists_prepare_ms=%.3f exists_route_ms=%.3f "
-                "exists_metadata_ms=%.3f "
-                "exists_native_ms=%.3f probe_ms=%.3f",
+                "exists_ms=%.3f exists_prepare_ms=%.3f exists_route_ms=%.3f "
+                "exists_metadata_ms=%.3f exists_native_ms=%.3f probe_ms=%.3f",
                 rid,
                 get_tensor_model_parallel_rank(),
                 len(keys),
@@ -598,8 +593,6 @@ class OceanDiskDirectLinker(UnifiedCacheLinker):
                 end * self.page_size,
                 pending_at_lookup,
                 queued_at_lookup,
-                timings["put_lock_ms"],
-                timings["put_sync_ms"],
                 timings["exists_ms"],
                 timings["exists_prepare_ms"],
                 timings["exists_route_ms"],
