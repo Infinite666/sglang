@@ -4887,6 +4887,18 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
         self._finalize_allocation_log(size)
 
+        per_layer_page_bytes = self.kv_buffer[0][0].nbytes * self.page_size
+        logger.info(
+            "DSA KV page size: %d bytes/layer, %d bytes total "
+            "(layer_num=%d, page_size=%d slots, kv_cache_dim=%d, store_dtype=%s)",
+            per_layer_page_bytes,
+            per_layer_page_bytes * self.layer_num,
+            self.layer_num,
+            self.page_size,
+            self.kv_cache_dim,
+            self.store_dtype,
+        )
+
     def _create_index_key_cache(self) -> IndexKeyCache:
         return IndexKeyCache(self, self.index_buf_size)
 
