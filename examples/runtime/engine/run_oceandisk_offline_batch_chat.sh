@@ -39,7 +39,6 @@ export SGLANG_DG_USE_NVRTC=1
 export CUDA_LAUNCH_BLOCKING=0
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export SGLANG_OCEANDISK_TRACE="${SGLANG_OCEANDISK_TRACE:-0}"
 
 exec "${PYTHON_BIN:-python3}" -u "${script_dir}/oceandisk_offline_batch_chat.py" \
     --model-path "$MODEL_PATH" \

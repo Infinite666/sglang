@@ -20,8 +20,6 @@ The tree only needs a handful of guarded hooks:
 from __future__ import annotations
 
 import logging
-import os
-import sys
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -307,7 +305,6 @@ class UnifiedCacheLinkerWrapper:
             self.handoff.add_tail_pages(batch, transfers, completed)
         if not transfers:
             return None
-        plan_done = time.perf_counter()
         session = self.cache_linker.begin_layerwise_save(transfers, phase=phase)
         for transfer, (req, _) in zip(transfers, completed, strict=True):
             receipts = getattr(req, "_uc_layerwise_receipts", None)
@@ -319,7 +316,6 @@ class UnifiedCacheLinkerWrapper:
                 if receipt is not None
             )
         if session is not None:
-            pin_start = time.perf_counter()
             pages = torch.cat(
                 [
                     transfer.device_indices[::page_size] // page_size
@@ -327,7 +323,6 @@ class UnifiedCacheLinkerWrapper:
                 ]
             )
             lease = allocator.pin_pages_for_io(pages)
-            pin_ms = (time.perf_counter() - pin_start) * 1000
             session.release_source = lambda: allocator.unpin_pages_for_io(lease)
 
             def on_submitted():
@@ -337,14 +332,8 @@ class UnifiedCacheLinkerWrapper:
                 self.pending_layerwise_saves.append(session)
 
             session.on_submitted = on_submitted
+            # PD trace reports this duration in uc.save.begin.
             session.prepare_ms = (time.perf_counter() - prepare_start) * 1000
-            session.prepare_details.update(
-                plan=(plan_done - prepare_start) * 1000,
-                pin=pin_ms,
-            )
-            session.prepare_details["other"] = session.prepare_ms - sum(
-                session.prepare_details.values()
-            )
         if self.handoff is not None:
             self.handoff.bind_session(transfers, completed, session)
         return session
@@ -397,12 +386,6 @@ class UnifiedCacheLinkerWrapper:
         if not tail_hashes:
             return result
 
-        perf_match = (
-            os.environ.get("SGLANG_OCEANDISK_PERF_TRACE") == "1"
-            and type(self.cache_linker).__module__.endswith("oceandisk_direct_linker")
-            and get_tensor_model_parallel_rank() == 0
-        )
-        lookup_start = time.perf_counter() if perf_match else 0.0
         lookup_transfers = []
         for component in self._components:
             transfer = component.build_external_linker_transfer(
@@ -415,50 +398,11 @@ class UnifiedCacheLinkerWrapper:
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
-        lookup_end = time.perf_counter() if perf_match else 0.0
         hit_pages = self._sync_restorable_prefix(
             restorable,
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
-        if perf_match:
-            rank_sync_ms = (time.perf_counter() - lookup_end) * 1000
-            # Inspect only the diagnostic path; do not retain live stack frames.
-            source = "unknown"
-            caller = "unknown"
-            frame = sys._getframe(1)
-            try:
-                for _ in range(16):
-                    if frame is None:
-                        break
-                    name = frame.f_code.co_name
-                    if name in ("match_prefix_for_req", "init_next_round_input"):
-                        source = name
-                        parent = frame.f_back
-                        if parent is not None:
-                            caller = f"{parent.f_code.co_name}:{parent.f_lineno}"
-                        del parent
-                        break
-                    frame = frame.f_back
-            finally:
-                del frame
-            query_seq = getattr(req, "_od_perf_query_seq", 0) + 1
-            req._od_perf_query_seq = query_seq
-            logger.info(
-                "[OceanDisk PERF MATCH] rid=%s input_tokens=%d hbm_tokens=%d "
-                "query_pages=%d od_tokens=%d lookup_ms=%.3f rank_sync_ms=%.3f "
-                "query_seq=%d source=%s caller=%s",
-                req.rid,
-                len(key),
-                device_hit_len,
-                len(tail_hashes),
-                hit_pages * page,
-                (lookup_end - lookup_start) * 1000,
-                rank_sync_ms,
-                query_seq,
-                source,
-                caller,
-            )
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page

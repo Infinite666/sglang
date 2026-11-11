@@ -24,8 +24,6 @@ OPEXTENSION="${OPEXTENSION:-/opt/oceandisk/libop_extension.so}"
 USE_SINGLE_PORT="${USE_SINGLE_PORT:-1}"
 GIDS_DIR="${GIDS_DIR:-/opt/oceandisk/config}"
 GIDS_CONFIG="${GIDS_CONFIG:-${GIDS_DIR%/}/gids_config.txt}"
-# OceanDisk trace：1 开启，0 关闭。
-export SGLANG_OCEANDISK_TRACE="${SGLANG_OCEANDISK_TRACE:-1}"
 
 mode=base
 case "${1:-}" in

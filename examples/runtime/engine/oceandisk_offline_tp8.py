@@ -145,8 +145,7 @@ def main():
     print(f"Dataset:     {args.dataset_path}", flush=True)
     print(
         f"External Linker: enabled={args.enable_unified_cache_external_linker}; "
-        f"backend={args.unified_cache_external_linker_backend}; "
-        f"trace={os.getenv('SGLANG_OCEANDISK_TRACE', '0')}",
+        f"backend={args.unified_cache_external_linker_backend}",
         flush=True,
     )
     with args.dataset_path.open(encoding="utf-8") as dataset:
