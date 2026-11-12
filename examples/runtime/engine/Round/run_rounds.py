@@ -9,6 +9,7 @@ SGLang Multi-Turn Conversation Benchmark (Optimized)
 4. 使用 Session 复用连接，提升并发性能。
 5. 预生成 Dummy 文本池，减少 CPU 开销。
 6. TTFT 测量点改为收到第一个 SSE 帧，而非首个 content token。
+   输出同时收集 delta.reasoning_content 与 delta.content（服务端开 --reasoning-parser 时思考部分在前者）。
 7. 支持 --record-response 开关记录流式返回的对话内容，每轮增量保存，Ctrl+C 中断时保存已有数据。
 8. 支持 --increment-tokens 0 时每轮发送相同请求，不累积历史。
 9. 使用 io.StringIO 替代字符串拼接缓存流式响应，提升性能。
@@ -280,7 +281,7 @@ class SGLangBatchBenchmark:
                                 ucl_trace.emit(
                                     "client.sse",
                                     rid,
-                                    content=bool(delta.get('content')),
+                                    content=bool(delta.get('content') or delta.get('reasoning_content')),
                                     usage='usage' in chunk and not chunk.get('choices'),
                                     id=chunk.get('id'),
                                 )
@@ -300,10 +301,14 @@ class SGLangBatchBenchmark:
                             # 注意：usage chunk 的 choices 为空数组，直接 [0] 会越界
                             choices = chunk.get('choices')
                             if choices:
-                                delta = choices[0].get('delta', {})
-                                content = delta.get('content', '')
-                                if content:
-                                    response_buffer.write(content)
+                                delta = choices[0].get('delta') or {}
+                                # With --reasoning-parser the thinking part arrives in
+                                # reasoning_content; it is generated output too, so it
+                                # counts toward output_tokens/TPOT and the recorded reply.
+                                for key in ('reasoning_content', 'content'):
+                                    text = delta.get(key)
+                                    if text:
+                                        response_buffer.write(text)
                         except json.JSONDecodeError as e:
                             # 打印解析失败的数据行（可能是 usage chunk 被分帧截断），便于诊断
                             print(f"    [warn] JSON parse failed: {e} | line={data_str[:120]!r}")
