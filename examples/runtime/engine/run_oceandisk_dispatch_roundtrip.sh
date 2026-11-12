@@ -4,6 +4,8 @@ set -euo pipefail
 # Edit these defaults for your GIDS installation.
 export OPEXTENSION="${OPEXTENSION:-/path/to/libop_extension.so}"
 export GIDS_DIR="${GIDS_DIR:-/path/to/gids_config_dir}"
+export PYTHONPATH="${PYTHONPATH:-/path/to/gids_kernel/}"
+export LIBGIDS="${LIBGIDS:-/path/to/libgids_kv_host.so}"
 # Per-GPU configs gids_config_<N>.txt need 0; gids_config.txt needs 1.
 export USE_SINGLE_PORT="${USE_SINGLE_PORT:-0}"
 
