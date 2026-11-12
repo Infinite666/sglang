@@ -1,19 +1,23 @@
 #!/bin/sh
-# 134 client: run after P, D and the router are ready. Writes rounds.json,
-# conversations/ and report.md, summary.json, trace.json next to decode.log.
+# Client: run after P, D and the router are ready.
+# Writes client.log, rounds.json and conversations/ to LOG_DIR.
 set -x
 
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+# ===== 现场配置 =====
+# 日志输出目录
+export LOG_DIR=/home/pd_logs/rounds
+# 语料：直接放到 examples/runtime/engine/Round/doupocangqiong.txt
+# ====================
 
-export SGLANG_UCL_TRACE=1
-export SGLANG_UCL_TRACE_DIR=/home/j00977581/pd_logs/latest
+# UCL trace 默认关闭
+# export SGLANG_UCL_TRACE=1
+# export SGLANG_UCL_TRACE_DIR=${LOG_DIR}
 
-cd /home/j00977581/sglang-pd/examples/runtime/engine/Round
-[ -e doupocangqiong.txt ] || ln -s /home/j00977581/Round/doupocangqiong.txt doupocangqiong.txt
+mkdir -p "${LOG_DIR}"
 
 python3 run_rounds.py \
     --base-url http://127.0.0.1:31345 \
-    --model /home/models/GLM-5.2-W4AFP8/ \
+    --model /home/models/GLM-5-FP8/ \
     --rounds 10 \
     --batch-size 10 \
     --initial-tokens 16000 \
@@ -21,9 +25,9 @@ python3 run_rounds.py \
     --output-len 16 \
     --record-response \
     --request-usage \
-    --conversation-dir /home/j00977581/pd_logs/latest/conversations \
-    --output-json /home/j00977581/pd_logs/latest/rounds.json \
-    2>&1 | tee -i /home/j00977581/pd_logs/latest/client.log
+    --conversation-dir "${LOG_DIR}/conversations" \
+    --output-json "${LOG_DIR}/rounds.json" \
+    2>&1 | tee -i "${LOG_DIR}/client.log"
 
-# Wait for two server flushes; P's half of the report stays on 132.
-python3 ucl_trace_tool.py report /home/j00977581/pd_logs/latest --wait 3
+# 开启 UCL trace 后取消注释：等待两次 server flush 后生成 report
+# python3 ucl_trace_tool.py report "${LOG_DIR}" --wait 3 --rounds-json "${LOG_DIR}/rounds.json"
