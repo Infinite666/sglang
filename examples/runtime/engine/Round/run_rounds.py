@@ -31,30 +31,10 @@ import re
 import io
 import os
 import signal
-import importlib.util
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
-
-def _load_ucl_trace():
-    """Load the stdlib-only recorder by path; importing sglang is too heavy."""
-    path = Path(__file__).resolve().parents[4] / "python/sglang/srt/observability/ucl_trace.py"
-    if not path.exists():
-        return None
-    spec = importlib.util.spec_from_file_location("ucl_trace", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module if module.ON else None
-
-
-# SGLANG_UCL_TRACE=1 + SGLANG_UCL_TRACE_DIR: record send/SSE/end per request
-# and pass a client rid so server events join; SGLANG_UCL_TRACE_CLIENT_RID=0
-# keeps the trace but stops sending rid (if a router rejects the field).
-ucl_trace = _load_ucl_trace()
-UCL_CLIENT_RID = os.environ.get("SGLANG_UCL_TRACE_CLIENT_RID", "1") != "0"
 
 @dataclass
 class SingleRequestResult:
@@ -215,10 +195,8 @@ class SGLangBatchBenchmark:
         max_tokens: int = 32,
         temperature: float = 0.0,
         routing_key: Optional[str] = None,
-        trace_tag: Optional[str] = None,
     ) -> SingleRequestResult:
         url = f"{self.base_url}/v1/chat/completions"
-        rid = f"{trace_tag}-{uuid.uuid4().hex[:8]}" if ucl_trace and trace_tag else None
         payload = {
             "model": self.model,
             "messages": messages,
@@ -231,16 +209,12 @@ class SGLangBatchBenchmark:
         # 默认关闭，避免不兼容 stream_options 的网关/路由拒绝请求（PD 分离走 router 时尤其注意）。
         if self.request_usage:
             payload["stream_options"] = {"include_usage": True}
-        if rid is not None and UCL_CLIENT_RID:
-            payload["rid"] = rid
 
         # Attach routing-key header for DP affinity in multi-turn PD
         headers = {}
         if routing_key is not None:
             headers["x-smg-routing-key"] = routing_key
 
-        if rid is not None:
-            ucl_trace.emit("client.send", rid, tag=trace_tag, sent_rid=UCL_CLIENT_RID)
         start_time = time.perf_counter()
         first_token_time = None
         response_buffer = io.StringIO()
@@ -254,8 +228,6 @@ class SGLangBatchBenchmark:
             with self.session.post(url, json=payload, headers=headers, stream=True, timeout=3000) as resp:
                 if resp.status_code != 200:
                     error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                    if rid is not None:
-                        ucl_trace.emit("client.end", rid, ok=False, error=error)
                     return SingleRequestResult(success=False, error=error)
 
                 # ---------- 修改点：TTFT 记录在收到第一个 SSE 帧时 ----------
@@ -275,22 +247,10 @@ class SGLangBatchBenchmark:
                             break
                         try:
                             chunk = json.loads(data_str)
-                            if rid is not None:
-                                choices = chunk.get('choices') or [{}]
-                                delta = choices[0].get('delta') or {}
-                                ucl_trace.emit(
-                                    "client.sse",
-                                    rid,
-                                    content=bool(delta.get('content') or delta.get('reasoning_content')),
-                                    usage='usage' in chunk and not chunk.get('choices'),
-                                    id=chunk.get('id'),
-                                )
                             if self.record_response:
                                 raw_chunks.append(chunk)
                             if 'error' in chunk:
                                 error = chunk['error'].get('message', 'Unknown API error')
-                                if rid is not None:
-                                    ucl_trace.emit("client.end", rid, ok=False, error=error)
                                 return SingleRequestResult(success=False, error=error)
                             # usage chunk（choices 为空数组）携带每请求的 token 统计
                             usage = chunk.get('usage')
@@ -318,8 +278,6 @@ class SGLangBatchBenchmark:
 
             full_response = response_buffer.getvalue()
             total_time = time.perf_counter() - start_time
-            if rid is not None:
-                ucl_trace.emit("client.end", rid, ok=error is None, error=error)
             ttft = (first_token_time - start_time) * 1000 if first_token_time else None
             output_tokens = self.count_tokens(full_response, kind="OUTPUT") if full_response else 0
 
@@ -344,8 +302,6 @@ class SGLangBatchBenchmark:
             )
 
         except Exception as e:
-            if rid is not None:
-                ucl_trace.emit("client.end", rid, ok=False, error=str(e)[:300])
             return SingleRequestResult(success=False, error=str(e))
 
     def run_batch_round(
@@ -391,7 +347,6 @@ class SGLangBatchBenchmark:
                         output_length,
                         temperature,
                         rk,
-                        f"r{getattr(self, 'trace_round', 0)}-{idx}",
                     )
                 ))
 
@@ -526,7 +481,6 @@ class SGLangBatchBenchmark:
             print()
 
         for round_num in range(1, rounds + 1):
-            self.trace_round = round_num
             # 为每个请求生成不同的 user message
             user_contents = []
             if no_increment:
@@ -668,9 +622,6 @@ def main():
                         help="请求 usage chunk 以获取每请求 kvcache 命中数（需服务端 --enable-cache-report 且支持 stream_options；PD 分离走 router 时若报错请关闭此开关）")
 
     args = parser.parse_args()
-    if ucl_trace:
-        ucl_trace.set_identity("client", "run_rounds")
-        print(f"UCL trace: {os.environ['SGLANG_UCL_TRACE_DIR']} (client rid={UCL_CLIENT_RID})")
 
     tokenizer = None
     if args.tokenizer:

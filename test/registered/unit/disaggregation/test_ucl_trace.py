@@ -326,17 +326,6 @@ class TestRecorder(unittest.TestCase):
             load(RECORDER, "ucl_idle", env).close()
             self.assertEqual(os.listdir(tmp), [])
 
-    def test_round_client_finds_recorder(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            env = {"SGLANG_UCL_TRACE": "1", "SGLANG_UCL_TRACE_DIR": tmp}
-            rounds = load(
-                ROOT / "examples/runtime/engine/Round/run_rounds.py",
-                "rounds_traced",
-                env,
-            )
-            self.assertIsNotNone(rounds.ucl_trace)
-            self.assertTrue(rounds.UCL_CLIENT_RID)
-
     def test_bounded_buffer_counts_drops(self):
         with tempfile.TemporaryDirectory() as tmp:
             module = load(
